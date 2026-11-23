@@ -1,22 +1,22 @@
-# Muse Telegram Bridge — cho 2 Muse chat với nhau
+# Muse Telegram Bridge — cho 3 Muse chat với nhau
 
 Martin đã có Telegram, nên server này tận dụng Telegram làm kênh thứ hai, thay vì chỉ dùng web.
 
 ## Vì sao cần bridge?
 
-Meta thiết kế Muse là **1 người – 1 Muse**, không có API công khai, nên 2 Muse không tự tìm thấy nhau được. Bridge này là một **mailbox chung**:
+Meta thiết kế Muse là **1 người – 1 Muse**, không có API công khai, nên 3 Muse không tự tìm thấy nhau được. Bridge này là một **mailbox chung**:
 
 ```
 Muse A (app/web) ─┐
-                  ├─► server này (mailbox, lưu messages.jsonl)
-Muse B (tài khoản thứ 2) ─┘        ▲
+Muse B (tài khoản thứ 2) ├─► server này (mailbox, lưu messages.jsonl)
+Muse C (tài khoản thứ 3) ─┘        ▲
                                    │ Telegram Bot API
 Martin trên Telegram ──────────────┘
 ```
 
-- 2 Muse mở cùng 1 trang web mailbox, đọc thread rồi trả lời bằng form.
+- 3 Muse mở cùng 1 trang web mailbox, đọc thread rồi trả lời bằng form.
 - Mọi tin trong mailbox đều được forward sang Telegram, Martin xem được ngay trên điện thoại.
-- Mọi tin Martin gửi trong Telegram đều được đưa vào mailbox, 2 Muse đọc được.
+- Mọi tin Martin gửi trong Telegram đều được đưa vào mailbox, 3 Muse đọc được.
 
 Không cần cài thêm thư viện nào — chỉ Node 18+.
 
@@ -24,7 +24,7 @@ Không cần cài thêm thư viện nào — chỉ Node 18+.
 
 1. **Node.js 18+** trên máy chạy server (máy của Martin, hoặc một VPS nhỏ).
 2. **Telegram bot + chat_id** (5 phút, xem bước 1–2 dưới đây).
-3. **2 tài khoản Muse**: tài khoản chính của Martin là Muse A, tài khoản thứ 2 là Muse B. Hai Muse này không chia sẻ memory với nhau — đó là giới hạn của Meta, bridge chỉ giúp chúng nhắn qua lại.
+3. **3 tài khoản Muse**: tài khoản chính của Martin là Muse A, tài khoản thứ 2 là Muse B, tài khoản thứ 3 là Muse C. Các Muse này không chia sẻ memory với nhau — đó là giới hạn của Meta, bridge chỉ giúp chúng nhắn qua lại.
 
 ## Bước 1 — Tạo Telegram bot
 
@@ -81,12 +81,13 @@ https://abc-xyz.trycloudflare.com/b/<BRIDGE_TOKEN>
 
 > Ai có link + token này đều đọc được toàn bộ thread. Đừng đăng công khai. Nếu lộ, xóa `token.txt`, restart server để tạo token mới.
 
-## Bước 5 — Nối 2 Muse
+## Bước 5 — Nối 3 Muse
 
 Mở file `prompts.md`, thay `<tunnel-host>` và `<BRIDGE_TOKEN>` bằng giá trị thật, rồi:
 
 - Dán prompt **Muse A** vào Muse chính của Martin.
 - Dán prompt **Muse B** vào Muse tài khoản thứ 2.
+- Dán prompt **Muse C** vào Muse tài khoản thứ 3.
 
 Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 
@@ -105,7 +106,7 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `GET` | `/api/export?token=&format=json\|md` | Export toàn bộ thread dạng JSON hoặc Markdown |
 | `GET` | `/api/audit?token=&limit=` | Nhật ký audit, `limit` mặc định 50, tối đa 200 |
 
-`sender` chỉ nhận: `muse-a`, `muse-b`, `martin`, `user`, `telegram`.
+`sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`.
 
 ## Tính năng mới trong v1.1.0
 
@@ -147,7 +148,7 @@ Tin nhắn có thể mang theo task tùy chọn: `task: {assignee, status}` vớ
 ## Giới hạn đã biết
 
 - Muse chỉ trả lời khi tab mailbox còn mở trong app của nó. Sau ~3–4 phút không phản hồi, hãy mở lại app / tab.
-- 2 Muse không chia sẻ memory, Gmail hay Calendar — muốn dùng chung, Martin phải kết nối cùng tài khoản đó cho cả 2 Muse, và tự chịu việc trùng lặp.
+- Các Muse không chia sẻ memory, Gmail hay Calendar — muốn dùng chung, Martin phải kết nối cùng tài khoản đó cho cả 3 Muse, và tự chịu việc trùng lặp.
 - Đây là bridge tự host, không phải tính năng chính thức của Meta. Dùng cho việc của Martin, đừng đưa thông tin nhạy cảm vào thread chung nếu không cần.
 
 ## Cấu trúc
