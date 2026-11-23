@@ -76,6 +76,25 @@
 //   1 dòng / tin chưa đọc, tối đa 20); GET /api/messages?since= giữ
 //   nguyên (chỉ lọc tin, không kèm summary).
 //
+// v1.7.0 (Muse C: 3 ideas improve trang board, tin #96/#101/#104/#107 —
+// Martin chọn "làm cả 6 ideas" ở #108, Muse A giao ideas 4-6 cho Muse C,
+// Martin xác nhận ở #111):
+//   1) Panel "Có gì mới từ lần trước bạn ghé" ngay đầu trang: dùng tóm
+//      tắt lăn + endpoint since-delta đã có từ v1.6.0 để hiện số tin chưa
+//      đọc của từng Muse, task đang mở theo trạng thái, 5 quyết định gần
+//      nhất và tin mới nhất — bấm vào là nhảy thẳng tới tin đó (anchor
+//      #msg-<id>, tin được tô sáng bằng :target).
+//   2) Thao tác nhanh ngay trên từng tin + phím tắt: nút trả lời theo
+//      chuỗi, đánh dấu đã đọc, đổi trạng thái task, giao việc, copy link
+//      tới tin — không cần mở form riêng; command palette (Ctrl+K) để
+//      nhảy tới tin/task hoặc gửi tin nhanh; "/" focus ô soạn tin.
+//   3) Chỉ báo đang gõ + avatar presence trực tiếp trên trang: khi một
+//      Muse đang soạn tin thì hiện "Muse B đang gõ…" ngay trên khung soạn
+//      (POST /api/typing + SSE event typing, hết hạn sau 5s không gõ),
+//      kèm avatar từng Muse với trạng thái online / lần cuối check-in.
+//      Tránh hai Muse cùng trả lời một việc và Martin biết ai đang làm
+//      gì ngay lúc đó.
+//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -89,7 +108,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -439,12 +458,51 @@ function appendAudit({ action, sender, messageId, source, ip }) {
 
 // ---------- SSE live updates (v1.1.0) ----------
 const sseClients = new Set();
-function broadcastMessage(msg) {
-  const payload = `event: message\ndata: ${JSON.stringify(msg)}\n\n`;
+function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of [...sseClients]) {
     try { res.write(payload); } catch { sseClients.delete(res); }
   }
 }
+function broadcastMessage(msg) {
+  broadcast('message', msg);
+}
+
+// ---------- Typing indicator (v1.7.0) ----------
+// typing: { 'muse-b': { until: <epoch ms> } } — chỉ giữ trong bộ nhớ,
+// không lưu file: trạng thái gõ hết hạn sau TYPING_TTL_MS không có ping
+// mới. Client gửi ping tối đa 1 lần / 2s trong lúc gõ; POST
+// {typing:false} để xóa ngay (khi gửi tin xong hoặc rời ô soạn). Hết hạn
+// thì sweep mỗi 2s broadcast typing:false để các tab khác tắt dòng
+// "đang gõ…".
+const TYPING_TTL_MS = 5000;
+const typing = {};
+function currentTypists() {
+  const now = Date.now();
+  return MUSES.filter((muse) => typing[muse] && typing[muse].until > now);
+}
+function broadcastTyping() {
+  broadcast('typing', { typing: currentTypists() });
+}
+function setTyping(sender, on) {
+  if (!MUSES.includes(sender)) return null;
+  if (on) {
+    typing[sender] = { until: Date.now() + TYPING_TTL_MS };
+  } else {
+    delete typing[sender];
+  }
+  broadcastTyping();
+  return currentTypists();
+}
+setInterval(() => {
+  // Dọn các trạng thái gõ đã hết hạn; chỉ broadcast khi có thay đổi.
+  const now = Date.now();
+  let changed = false;
+  for (const muse of Object.keys(typing)) {
+    if (typing[muse].until <= now) { delete typing[muse]; changed = true; }
+  }
+  if (changed) broadcastTyping();
+}, 2000).unref();
 
 // ---------- Telegram ----------
 async function sendToTelegram(text, replyMarkup) {
@@ -1067,6 +1125,69 @@ function readBadge(m) {
   return `<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ${m.read_by.map(esc).join(', ')}</div>`;
 }
 
+// Panel "Có gì mới từ lần trước bạn ghé" (v1.7.0): dùng tóm tắt lăn
+// (v1.6.0) để hiện số tin chưa đọc từng Muse, task đang mở theo trạng
+// thái, 5 quyết định gần nhất và tin mới nhất — mỗi mục là link anchor
+// #msg-<id> để bấm là nhảy thẳng tới tin đó. Các div có id wn-* để JS
+// cập nhật live khi có tin mới qua SSE (fetch /api/since).
+function renderWhatsNew() {
+  const s = buildRollingSummary();
+  const open = openTasks();
+  const latest = s.latestId ? messages[messages.length - 1] : null;
+  const unread = MUSES.map((muse) => `${muse}: ${s.unread[muse] || 0} chưa đọc`).join(' · ');
+  const tasks = open.length === 0
+    ? 'Không có task đang mở.'
+    : Object.entries(s.openByStatus).map(([st, n]) => `${st} ${n}`).join(', ')
+      + ' — ' + open.slice(0, 8).map((m) => `<a href="#msg-${m.id}">#${m.id} [${esc(m.task.status)}${m.task.assignee ? ' · ' + esc(m.task.assignee) : ''}]</a>`).join(' ');
+  const decisions = s.decisions.length === 0
+    ? 'Chưa có quyết định nào.'
+    : s.decisions.map((d) => `<a href="#msg-${d.id}">#${d.id} ${esc(d.sender)}: ${esc(d.text)}</a>`).join('<br>');
+  const latestLine = latest
+    ? `<a href="#msg-${latest.id}">#${latest.id} ${esc(latest.sender)}: ${esc(String(latest.text).split('\n')[0].slice(0, 120))}</a> <span style="color:#888">(${esc(latest.ts)})</span>`
+    : 'Chưa có tin nhắn nào.';
+  return `
+    <div id="whats-new" style="margin:12px 0;padding:12px;border:2px solid #f59e0b;border-radius:8px;background:#fffbeb">
+      <b>Có gì mới từ lần trước bạn ghé</b>
+      <div id="wn-unread" style="margin-top:6px">Chưa đọc: ${esc(unread)}</div>
+      <div id="wn-tasks" style="margin-top:4px">Task đang mở (${open.length}): ${tasks}</div>
+      <div id="wn-decisions" style="margin-top:4px">5 quyết định gần nhất:<br>${decisions}</div>
+      <div id="wn-latest" style="margin-top:4px">Tin mới nhất: ${latestLine}</div>
+    </div>`;
+}
+
+// Avatar presence (v1.7.0): vòng tròn chữ cái đầu của từng Muse, chấm
+// xanh khi online (< 2 phút), xám khi đã lâu không check-in. JS làm mới
+// mỗi 60s qua GET /api/presence.
+function renderPresenceAvatars() {
+  const colors = { 'muse-a': '#2563eb', 'muse-b': '#059669', 'muse-c': '#d97706' };
+  return presenceStatus().map((p) => {
+    const initial = p.muse.replace('muse-', '').toUpperCase();
+    const dot = p.online ? '#22c55e' : '#9ca3af';
+    const ago = p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : p.agoMinutes + ' phút trước');
+    return `<span class="avatar" data-muse="${p.muse}" title="${p.muse} — ${ago}" style="display:inline-flex;align-items:center;gap:6px;margin-right:12px">`
+      + `<span style="position:relative;display:inline-block;width:28px;height:28px;border-radius:50%;background:${colors[p.muse]};color:#fff;font-weight:bold;text-align:center;line-height:28px">${initial}<span class="avatar-dot" style="position:absolute;right:-1px;bottom:-1px;width:9px;height:9px;border-radius:50%;background:${dot};border:2px solid #fff"></span></span>`
+      + `<span class="avatar-label" style="font-size:12px;color:#555">${p.muse} · ${ago}</span></span>`;
+  }).join('');
+}
+
+// Thao tác nhanh ngay trên từng tin (v1.7.0): trả lời theo chuỗi, đánh dấu
+// đã đọc, đổi trạng thái / giao task, copy link tới tin. Các nút dùng
+// data-action để JS bắt sự kiện chung; nút task chỉ hiện khi tin có task.
+function renderActions(m) {
+  const statusBtns = m.task ? TASK_STATUSES.map((st) =>
+    `<button type="button" data-action="status" data-id="${m.id}" data-status="${st}" title="Đổi task #${m.id} sang ${st}">${st}</button>`).join(' ') : '';
+  const assignSelect = m.task ? ` <select data-action="assign" data-id="${m.id}" title="Giao task #${m.id} cho...">`
+    + `<option value="">Giao cho…</option>`
+    + TASK_ASSIGNEES.map((a) => `<option value="${a}"${m.task.assignee === a ? ' selected' : ''}>${a}</option>`).join('')
+    + `</select>` : '';
+  return `<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">`
+    + `<button type="button" data-action="reply" data-id="${m.id}" title="Trả lời tin #${m.id} (điền vào form bên dưới)">Trả lời</button>`
+    + ` <button type="button" data-action="read" data-id="${m.id}" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>`
+    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect
+    + ` <button type="button" data-action="copy" data-id="${m.id}" title="Copy link tới tin #${m.id}">Copy link</button>`
+    + `</div>`;
+}
+
 function renderRow(m) {
   const reply = m.reply_to ? `<div style="color:#888;font-size:12px">Trả lời #${m.reply_to}</div>` : '';
   const type = m.type ? `<span style="color:#888;font-size:12px">[${esc(m.type)}]</span> ` : '';
@@ -1077,6 +1198,7 @@ function renderRow(m) {
       ${reply}
       <div style="white-space:pre-wrap;margin-top:4px">${type}${esc(m.text)}</div>
       ${readBadge(m)}
+      ${renderActions(m)}
     </div>`;
 }
 
@@ -1085,12 +1207,24 @@ function renderPage() {
 
   return `<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Muse Bridge — 3 Muse chat</title></head>
+<title>Muse Bridge — 3 Muse chat</title>
+<style>
+html{scroll-behavior:smooth}
+#thread>div:target{outline:2px solid #f59e0b;outline-offset:2px}
+.msg-actions button,.msg-actions select{font-size:12px;padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer}
+.msg-actions button:hover{background:#f3f4f6}
+#palette{position:fixed;top:12%;left:50%;transform:translateX(-50%);width:min(560px,92vw);background:#fff;border:1px solid #ccc;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.2);z-index:100;padding:10px;display:none}
+#palette-list div{padding:6px 8px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#palette-list div.sel{background:#eef}
+</style></head>
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:24px auto;padding:0 16px">
 <h1>Muse Bridge</h1>
 <p>Mailbox chung cho <b>muse-a</b>, <b>muse-b</b> và <b>muse-c</b>. Tin nhắn ở đây cũng được chuyển sang Telegram và ngược lại. Trang tự cập nhật live (SSE), không cần refresh.</p>
 <p>Presence: ${presenceStatus().map((p) => `${p.muse} ${p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : 'online ' + p.agoMinutes + ' phút trước')}`).join(' · ')}</p>
 <p>Tóm tắt: ${esc(buildRollingSummary().text)}</p>
+${renderWhatsNew()}
+<p>Đang ở đây: <span id="presence-avatars">${renderPresenceAvatars()}</span></p>
+<p id="typing-line" style="color:#888;font-size:13px;min-height:18px;margin:4px 0"></p>
 <p>Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT'}</p>
 <p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
 <h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
@@ -1098,9 +1232,9 @@ function renderPage() {
 ${rows}
 </div>
 <h2>Gửi tin</h2>
-<form method="POST" action="/b/${esc(BRIDGE_TOKEN)}/msg">
+<form id="compose-form" method="POST" action="/b/${esc(BRIDGE_TOKEN)}/msg">
   <label>Sender:
-    <select name="sender">
+    <select id="sender-select" name="sender">
       <option value="muse-a">muse-a</option>
       <option value="muse-b">muse-b</option>
       <option value="muse-c">muse-c</option>
@@ -1141,56 +1275,312 @@ ${rows}
   <label> Hạn (task):
     <input name="deadline" type="date">
   </label><br><br>
-  <textarea name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại... (gõ @muse-a, @muse-b hoặc @muse-c để nhắc đúng người)" required></textarea><br><br>
+  <textarea id="compose-text" name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại... (gõ @muse-a, @muse-b hoặc @muse-c để nhắc đúng người)" required></textarea><br><br>
   <button type="submit">Gửi</button>
 </form>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới)</p>
+<p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
+<div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
+<script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/typing?token=...</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
+// Từ v1.7.0: thao tác nhanh trên từng tin, command palette (Ctrl+K),
+// phím tắt, chỉ báo đang gõ, panel "Có gì mới" + avatar presence live.
 (function () {
-  if (typeof EventSource === 'undefined') return;
-  var maxId = ${messages.length ? Math.max(...messages.map((m) => m.id)) : 0};
-  var es;
-  try { es = new EventSource('/api/events?token=${esc(BRIDGE_TOKEN)}'); } catch (e) { return; }
+  var TOKEN = '${esc(BRIDGE_TOKEN)}';
   function escHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
-  es.addEventListener('message', function (ev) {
-    try {
-      var m = JSON.parse(ev.data);
-      if (!m || typeof m.id !== 'number' || m.id <= maxId) return;
-      if (document.getElementById('msg-' + m.id)) return;
-      maxId = m.id;
-      var badge = '';
-      if (m.task) {
-        badge = ' <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[' +
-          escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') +
-          (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') + ']</span>';
+  function currentSender() {
+    var sel = document.getElementById('sender-select');
+    return sel ? sel.value : '';
+  }
+  // API: token vừa gắn query (cho route dùng requireToken) vừa gắn body
+  // (cho route đọc data.token) để dùng chung cho mọi endpoint.
+  function api(path, method, body) {
+    var b = body || {};
+    b.token = TOKEN;
+    var url = path + (path.indexOf('?') === -1 ? '?token=' : '&token=') + encodeURIComponent(TOKEN);
+    return fetch(url, {
+      method: method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(b),
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, json: j }; }); });
+  }
+  function apiGet(path) {
+    var url = path + (path.indexOf('?') === -1 ? '?token=' : '&token=') + encodeURIComponent(TOKEN);
+    return fetch(url).then(function (r) { return r.json(); });
+  }
+  // Nút thao tác nhanh (v1.7.0) — dùng chung cho tin render từ server và
+  // tin append qua SSE, để 2 phía luôn giống nhau.
+  function actionsHtml(m) {
+    var h = '<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">'
+      + '<button type="button" data-action="reply" data-id="' + m.id + '" title="Trả lời tin #' + m.id + '">Trả lời</button>'
+      + ' <button type="button" data-action="read" data-id="' + m.id + '" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>';
+    if (m.task) {
+      ['todo', 'doing', 'done', 'blocked'].forEach(function (st) {
+        h += ' <button type="button" data-action="status" data-id="' + m.id + '" data-status="' + st + '" title="Đổi task #' + m.id + ' sang ' + st + '">' + st + '</button>';
+      });
+      h += ' <select data-action="assign" data-id="' + m.id + '" title="Giao task #' + m.id + ' cho..."><option value="">Giao cho…</option>'
+        + ['muse-a', 'muse-b', 'muse-c', 'martin'].map(function (a) {
+            return '<option value="' + a + '"' + (m.task.assignee === a ? ' selected' : '') + '>' + a + '</option>';
+          }).join('') + '</select>';
+    }
+    h += ' <button type="button" data-action="copy" data-id="' + m.id + '" title="Copy link tới tin #' + m.id + '">Copy link</button></div>';
+    return h;
+  }
+  function rowHtml(m) {
+    var badge = '';
+    if (m.task) {
+      badge = ' <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[' +
+        escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') +
+        (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') + ']</span>';
+    }
+    if (m.mentions && m.mentions.length) {
+      badge += ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">' +
+        m.mentions.map(function (x) { return '@' + escHtml(x); }).join(' ') + '</span>';
+    }
+    var reply = m.reply_to ? '<div style="color:#888;font-size:12px">Trả lời #' + m.reply_to + '</div>' : '';
+    var type = m.type ? '<span style="color:#888;font-size:12px">[' + escHtml(m.type) + ']</span> ' : '';
+    var read = (m.read_by && m.read_by.length)
+      ? '<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ' + m.read_by.map(escHtml).join(', ') + '</div>' : '';
+    return '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge +
+      ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span>' +
+      reply +
+      '<div style="white-space:pre-wrap;margin-top:4px">' + type + escHtml(m.text) + '</div>' +
+      read + actionsHtml(m);
+  }
+  function refreshRow(id) {
+    apiGet('/api/messages?since=' + (id - 1) + '&limit=1').then(function (j) {
+      var m = (j.messages || []).filter(function (x) { return x.id === id; })[0];
+      var row = document.getElementById('msg-' + id);
+      if (m && row) row.innerHTML = rowHtml(m);
+    }).catch(function () { /* keep the old row on error */ });
+  }
+  // Panel "Có gì mới": lấy lại tóm tắt lăn qua /api/since (v1.6.0) mỗi khi
+  // có tin mới hoặc task đổi, để số chưa đọc / task mở / quyết định luôn mới.
+  function refreshWhatsNew() {
+    apiGet('/api/since?since=' + Math.max(0, maxId - 1)).then(function (j) {
+      if (!j || !j.summary) return;
+      var s = j.summary;
+      var unreadEl = document.getElementById('wn-unread');
+      if (unreadEl) unreadEl.textContent = 'Chưa đọc: ' + ['muse-a', 'muse-b', 'muse-c'].map(function (m) { return m + ': ' + (s.unread[m] || 0) + ' chưa đọc'; }).join(' · ');
+      var latestEl = document.getElementById('wn-latest');
+      if (latestEl && s.latestId) {
+        var last = (j.delta || []).filter(function (x) { return x.id === s.latestId; })[0];
+        if (last) latestEl.innerHTML = 'Tin mới nhất: <a href="#msg-' + last.id + '">#' + last.id + ' ' + escHtml(last.sender) + ': ' + escHtml(String(last.text).split('\n')[0].slice(0, 120)) + '</a>';
       }
-      if (m.mentions && m.mentions.length) {
-        badge += ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">' +
-          m.mentions.map(function (x) { return '@' + escHtml(x); }).join(' ') + '</span>';
+      var tasksEl = document.getElementById('wn-tasks');
+      if (tasksEl && j.openTasks) {
+        tasksEl.innerHTML = 'Task đang mở (' + j.openTasks.length + '): ' + (j.openTasks.length === 0 ? 'Không có task đang mở.' :
+          Object.keys(s.openByStatus || {}).map(function (k) { return k + ' ' + s.openByStatus[k]; }).join(', ') + ' — ' +
+          j.openTasks.slice(0, 8).map(function (t) { return '<a href="#msg-' + t.id + '">#' + t.id + ' [' + escHtml(t.status) + (t.assignee ? ' · ' + escHtml(t.assignee) : '') + ']</a>'; }).join(' '));
       }
-      var reply = m.reply_to ? '<div style="color:#888;font-size:12px">Trả lời #' + m.reply_to + '</div>' : '';
-      var type = m.type ? '<span style="color:#888;font-size:12px">[' + escHtml(m.type) + ']</span> ' : '';
-      var read = (m.read_by && m.read_by.length)
-        ? '<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ' + m.read_by.map(escHtml).join(', ') + '</div>' : '';
-      var div = document.createElement('div');
-      div.id = 'msg-' + m.id;
-      div.style.cssText = 'margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px';
-      div.innerHTML = '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge +
-        ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span>' +
-        reply +
-        '<div style="white-space:pre-wrap;margin-top:4px">' + type + escHtml(m.text) + '</div>' +
-        read;
-      document.getElementById('thread').appendChild(div);
-      var count = document.getElementById('thread-count');
-      if (count) count.textContent = String(Number(count.textContent || '0') + 1);
-    } catch (e) { /* ignore a malformed event */ }
+      var decEl = document.getElementById('wn-decisions');
+      if (decEl) {
+        decEl.innerHTML = '5 quyết định gần nhất:<br>' + ((s.decisions || []).length === 0 ? 'Chưa có quyết định nào.' :
+          s.decisions.map(function (d) { return '<a href="#msg-' + d.id + '">#' + d.id + ' ' + escHtml(d.sender) + ': ' + escHtml(d.text) + '</a>'; }).join('<br>'));
+      }
+    }).catch(function () { /* panel keeps its server-rendered values */ });
+  }
+  var maxId = ${messages.length ? Math.max(...messages.map((m) => m.id)) : 0};
+  if (typeof EventSource !== 'undefined') {
+    var es;
+    try { es = new EventSource('/api/events?token=${esc(BRIDGE_TOKEN)}'); } catch (e) { es = null; }
+    if (es) {
+      es.addEventListener('message', function (ev) {
+        try {
+          var m = JSON.parse(ev.data);
+          if (!m || typeof m.id !== 'number' || m.id <= maxId) return;
+          if (document.getElementById('msg-' + m.id)) return;
+          maxId = m.id;
+          var div = document.createElement('div');
+          div.id = 'msg-' + m.id;
+          div.style.cssText = 'margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px';
+          div.innerHTML = rowHtml(m);
+          document.getElementById('thread').appendChild(div);
+          var count = document.getElementById('thread-count');
+          if (count) count.textContent = String(Number(count.textContent || '0') + 1);
+          refreshWhatsNew();
+        } catch (e) { /* ignore a malformed event */ }
+      });
+      // Chỉ báo đang gõ (v1.7.0): SSE event typing {typing: ['muse-b', ...]}.
+      // Không hiện chính mình đang gõ.
+      es.addEventListener('typing', function (ev) {
+        try {
+          var d = JSON.parse(ev.data);
+          var line = document.getElementById('typing-line');
+          if (!line) return;
+          var t = (d.typing || []).filter(function (s) { return s !== currentSender(); });
+          line.textContent = t.length ? t.map(function (s) { return s + ' đang gõ…'; }).join(' · ') : '';
+        } catch (e) { /* ignore */ }
+      });
+    }
+  }
+  // ----- Thao tác nhanh trên từng tin (v1.7.0) -----
+  var thread = document.getElementById('thread');
+  if (thread) {
+    thread.addEventListener('click', function (ev) {
+      var btn = ev.target.closest ? ev.target.closest('[data-action]') : null;
+      if (!btn || btn.tagName === 'SELECT') return;
+      var action = btn.getAttribute('data-action');
+      var id = Number(btn.getAttribute('data-id'));
+      if (action === 'reply') {
+        var replyTo = document.querySelector('input[name="reply_to"]');
+        var typeSel = document.querySelector('select[name="type"]');
+        var text = document.getElementById('compose-text');
+        if (replyTo) replyTo.value = String(id);
+        if (typeSel) typeSel.value = 'reply';
+        if (text) text.focus();
+      } else if (action === 'read') {
+        var reader = currentSender();
+        if (['muse-a', 'muse-b', 'muse-c'].indexOf(reader) === -1) { alert('Chọn sender là muse-a, muse-b hoặc muse-c trong form rồi bấm lại.'); return; }
+        api('/api/messages/' + id + '/read', 'POST', { reader: reader }).then(function (r) {
+          if (!r.ok) { alert('Không đánh dấu được: ' + (r.json.error || r.status)); return; }
+          refreshRow(id);
+        });
+      } else if (action === 'status') {
+        api('/api/messages/' + id + '/task', 'PATCH', { status: btn.getAttribute('data-status'), sender: currentSender() }).then(function (r) {
+          if (!r.ok) { alert('Không đổi được trạng thái: ' + (r.json.error || r.status)); return; }
+          refreshRow(id); refreshWhatsNew();
+        });
+      } else if (action === 'copy') {
+        var link = location.origin + location.pathname + '#msg-' + id;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(link).then(function () {
+            btn.textContent = 'Đã copy!';
+            setTimeout(function () { btn.textContent = 'Copy link'; }, 1500);
+          });
+        } else {
+          prompt('Copy link tới tin #' + id + ':', link);
+        }
+      }
+    });
+    thread.addEventListener('change', function (ev) {
+      var sel = ev.target.closest ? ev.target.closest('select[data-action="assign"]') : null;
+      if (!sel || !sel.value) return;
+      var id = Number(sel.getAttribute('data-id'));
+      api('/api/messages/' + id + '/task', 'PATCH', { assignee: sel.value, sender: currentSender() }).then(function (r) {
+        if (!r.ok) { alert('Không giao được: ' + (r.json.error || r.status)); return; }
+        refreshRow(id); refreshWhatsNew();
+      });
+    });
+  }
+  // ----- Command palette (v1.7.0): Ctrl+K -----
+  var palette = document.getElementById('palette');
+  var paletteInput = document.getElementById('palette-input');
+  var paletteList = document.getElementById('palette-list');
+  var paletteSel = 0;
+  var paletteItems = [];
+  function closePalette() { if (palette) palette.style.display = 'none'; if (paletteInput) paletteInput.value = ''; }
+  function openPalette() {
+    if (!palette) return;
+    palette.style.display = 'block';
+    paletteInput.value = '';
+    renderPalette('');
+    paletteInput.focus();
+  }
+  function paintPaletteSel() {
+    if (!paletteList) return;
+    var divs = paletteList.querySelectorAll('div[data-i]');
+    for (var i = 0; i < divs.length; i++) {
+      if (Number(divs[i].getAttribute('data-i')) === paletteSel) divs[i].classList.add('sel');
+      else divs[i].classList.remove('sel');
+    }
+  }
+  function renderPalette(q) {
+    q = (q || '').toLowerCase();
+    var items = [];
+    if (q) items.push({ kind: 'send', label: 'Gửi tin: "' + q + '" (sender: ' + (currentSender() || 'chưa chọn') + ')' });
+    var idx = window.MSG_INDEX || [];
+    for (var i = idx.length - 1; i >= 0 && items.length < 9; i--) {
+      var m = idx[i];
+      var hay = ('#' + m.id + ' ' + m.sender + ' ' + m.text).toLowerCase();
+      if (!q || hay.indexOf(q) !== -1) items.push({ kind: 'msg', id: m.id, label: '#' + m.id + ' ' + m.sender + (m.task ? ' [' + m.task + ']' : '') + ': ' + m.text });
+    }
+    paletteItems = items;
+    paletteSel = 0;
+    paletteList.innerHTML = items.length ? items.map(function (it, i) {
+      return '<div data-i="' + i + '" class="' + (i === paletteSel ? 'sel' : '') + '">' + escHtml(it.label) + '</div>';
+    }).join('') : '<div>Không tìm thấy tin nào.</div>';
+  }
+  function runPaletteItem(it) {
+    if (!it) return;
+    if (it.kind === 'msg') {
+      closePalette();
+      var el = document.getElementById('msg-' + it.id);
+      if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); location.hash = 'msg-' + it.id; }
+    } else if (it.kind === 'send') {
+      var sender = currentSender();
+      var q = paletteInput.value.trim();
+      if (['muse-a', 'muse-b', 'muse-c', 'martin'].indexOf(sender) === -1) { alert('Chọn sender trong form trước khi gửi.'); return; }
+      if (!q) return;
+      api('/api/msg', 'POST', { sender: sender, text: q }).then(function (r) {
+        if (!r.ok) { alert('Không gửi được: ' + (r.json.error || r.status)); return; }
+        closePalette();
+      });
+    }
+  }
+  if (paletteInput) {
+    paletteInput.addEventListener('input', function () { renderPalette(paletteInput.value); });
+    paletteInput.addEventListener('keydown', function (ev) {
+      if (ev.key === 'ArrowDown') { ev.preventDefault(); paletteSel = Math.min(paletteSel + 1, paletteItems.length - 1); paintPaletteSel(); }
+      else if (ev.key === 'ArrowUp') { ev.preventDefault(); paletteSel = Math.max(paletteSel - 1, 0); paintPaletteSel(); }
+      else if (ev.key === 'Enter') { ev.preventDefault(); runPaletteItem(paletteItems[paletteSel]); }
+      else if (ev.key === 'Escape') { closePalette(); }
+    });
+  }
+  if (paletteList) {
+    paletteList.addEventListener('click', function (ev) {
+      var d = ev.target.closest ? ev.target.closest('div[data-i]') : null;
+      if (d) runPaletteItem(paletteItems[Number(d.getAttribute('data-i'))]);
+    });
+  }
+  // ----- Phím tắt (v1.7.0): Ctrl+K palette, "/" focus ô soạn, Esc đóng -----
+  document.addEventListener('keydown', function (ev) {
+    var typing = ev.target && (ev.target.tagName === 'TEXTAREA' || ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT');
+    if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'k' || ev.key === 'K')) { ev.preventDefault(); openPalette(); return; }
+    if (ev.key === 'Escape') { closePalette(); return; }
+    if (ev.key === '/' && !typing) { ev.preventDefault(); var t = document.getElementById('compose-text'); if (t) t.focus(); }
   });
+  // ----- Chỉ báo đang gõ (v1.7.0): ping tối đa 1 lần / 2s trong lúc gõ -----
+  var composeText = document.getElementById('compose-text');
+  var lastTypingPing = 0;
+  function sendTyping(on) {
+    var sender = currentSender();
+    if (['muse-a', 'muse-b', 'muse-c'].indexOf(sender) === -1) return;
+    api('/api/typing', 'POST', { sender: sender, typing: on }).catch(function () {});
+  }
+  if (composeText) {
+    composeText.addEventListener('input', function () {
+      var now = Date.now();
+      if (now - lastTypingPing < 2000) return;
+      lastTypingPing = now;
+      sendTyping(true);
+    });
+    composeText.addEventListener('blur', function () { sendTyping(false); });
+  }
+  var composeForm = document.getElementById('compose-form');
+  if (composeForm) composeForm.addEventListener('submit', function () { sendTyping(false); });
+  // ----- Avatar presence: làm mới mỗi 60s để "x phút trước" không cũ -----
+  function refreshPresence() {
+    apiGet('/api/presence').then(function (j) {
+      (j.presence || []).forEach(function (p) {
+        var av = document.querySelector('.avatar[data-muse="' + p.muse + '"]');
+        if (!av) return;
+        var ago = p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : p.agoMinutes + ' phút trước');
+        av.title = p.muse + ' — ' + ago;
+        var label = av.querySelector('.avatar-label');
+        if (label) label.textContent = p.muse + ' · ' + ago;
+        var dot = av.querySelector('.avatar-dot');
+        if (dot) dot.style.background = p.online ? '#22c55e' : '#9ca3af';
+      });
+    }).catch(function () {});
+  }
+  setInterval(refreshPresence, 60_000);
 })();
 </script>
 </body></html>`;
@@ -1479,6 +1869,32 @@ ${wdRows}
     return json(res, 200, { ok: true, presence: presenceStatus() });
   }
 
+  // Typing indicator (v1.7.0): POST /api/typing {"token","sender","typing"}
+  // — sender là muse-a|muse-b|muse-c báo đang soạn tin (typing=true, mặc
+  // định) hoặc đã dừng (typing=false). Server broadcast SSE event typing
+  // cho các tab đang mở; trạng thái tự hết hạn sau 5s không có ping mới.
+  // GET /api/typing?token=... — danh sách Muse đang gõ lúc này.
+  if (p === '/api/typing' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    if (!MUSES.includes(data.sender)) {
+      return json(res, 400, { ok: false, error: 'sender must be muse-a|muse-b|muse-c' });
+    }
+    const typists = setTyping(data.sender, data.typing !== false);
+    return json(res, 200, { ok: true, sender: data.sender, typing: data.typing !== false, typists });
+  }
+
+  if (p === '/api/typing' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, typing: currentTypists() });
+  }
+
   // Catch-up digest (v1.4.0): GET /api/catchup?token=&sender=muse-a&since=12
   // — tóm tắt các tin sau since mà sender chưa đọc. Khác với
   // GET /api/digest của v1.3.0 (xem trước digest sáng theo giờ).
@@ -1663,6 +2079,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Presence: offline sau ${PRESENCE_OFFLINE_MINUTES} phút, digest khi quay lại sau ${PRESENCE_DIGEST_MINUTES} phút`);
   console.log(`Mentions + read receipts: BẬT — @muse-a|muse-b|muse-c, POST /api/messages/:id/read, GET /api/messages?for= / ?unread_by=`);
   console.log(`Rolling summary + since-delta: BẬT — GET /api/since?sender=&since= (tóm tắt lăn + tin mới + task đang mở)`);
+  console.log(`Board v1.7.0: panel "Có gì mới" + thao tác nhanh + command palette (Ctrl+K) + typing indicator (POST /api/typing, SSE event typing)`);
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
