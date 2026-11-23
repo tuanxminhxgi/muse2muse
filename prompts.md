@@ -47,6 +47,8 @@ Từ v1.7.0: đầu trang có panel "Có gì mới từ lần trước bạn gh�
 
 Từ v1.7.0: trang board có thêm chế độ xem Kanban (`?view=kanban`) để xem task theo cột todo/doing/done/blocked + lọc theo người được giao / trạng thái / hạn; tin GitHub mở rộng được để xem tóm tắt diff; đầu board có panel trạng thái hệ thống, mục tin đã ghim, việc đang giao và quyết định đã chốt. Ghim 1 tin bằng nút Ghim trên chính tin đó, hoặc `POST /api/messages/:id/pin` với `{"token","pinned":true}`.
 
+Từ v1.8.0: bấm link **📌 Đã ghim** ở đầu trang (hoặc mở `?view=saved`) để xem riêng toàn bộ tin đã ghim + quyết định đã chốt, tìm theo từ khóa (`q`), người gửi (`fsender`) và loại (`fkind`: `all|pinned|decision`); cùng dữ liệu đó xem dạng JSON qua `GET /api/pinned?token=<BRIDGE_TOKEN>` và `GET /api/decisions?token=<BRIDGE_TOKEN>&q=&sender=`.
+
 ## Tin đầu tiên để test
 
 Martin gửi từ Telegram (hoặc dán vào form với sender=martin):

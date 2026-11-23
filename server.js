@@ -114,7 +114,20 @@
 //      (POST /api/typing + SSE event typing, hết hạn sau 5s không gõ),
 //      kèm avatar từng Muse với trạng thái online / lần cuối check-in.
 //      Tránh hai Muse cùng trả lời một việc và Martin biết ai đang làm
-//      gì ngay lúc đó.//
+//      gì ngay lúc đó.
+//
+// v1.8.0 (Muse C: idea 4 trong 3 ideas ở tin #171/#174 — Martin chọn "làm
+// cả 3 ideas", Muse A giao idea 4 cho Muse C ở #178; Muse B đã làm ghim
+// tay + bảng Quyết định ở v1.7.0, phần còn thiếu là tra cứu riêng):
+//   Chế độ xem riêng "Đã ghim & Quyết định" (?view=saved): liệt kê đầy đủ
+//   tin đã ghim + tin type=decision (mới nhất trước, toàn bộ nội dung,
+//   không chỉ 10 dòng đầu như mục đầu board), kèm form tìm kiếm theo từ
+//   khóa (q, khớp không phân biệt hoa thường), người gửi (fsender) và
+//   loại (fkind: all|pinned|decision). API: GET /api/pinned?token= (toàn
+//   bộ tin đã ghim, mới nhất trước) và GET /api/decisions?token=&q=
+//   &sender= (tin type=decision, lọc theo từ khóa + người gửi). Dùng lại
+//   cờ pinned và type=decision đã có từ v1.7.0/v1.5.0, không thêm field
+//   hay file mới.
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -128,7 +141,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.7.0';
+const VERSION = '1.8.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -1492,19 +1505,71 @@ function filterForm(f) {
 </form>`;
 }
 
+// Đã ghim & Quyết định — tra cứu riêng (v1.8.0): gộp tin đã ghim (cờ
+// pinned, v1.7.0) và tin type=decision (v1.5.0) thành 1 danh sách lưu
+// riêng, mới nhất trước. kind: 'all' (cả hai), 'pinned', 'decision'.
+// q: từ khóa khớp không phân biệt hoa thường trong nội dung tin.
+// sender: lọc đúng người gửi (rỗng = tất cả).
+function filterSaved({ q = '', sender = '', kind = 'all' } = {}) {
+  const needle = String(q || '').trim().toLowerCase();
+  return messages.filter((m) => {
+    if (kind === 'pinned' && !m.pinned) return false;
+    if (kind === 'decision' && m.type !== 'decision') return false;
+    if (kind !== 'pinned' && kind !== 'decision' && !(m.pinned || m.type === 'decision')) return false;
+    if (sender && m.sender !== sender) return false;
+    if (needle && !String(m.text || '').toLowerCase().includes(needle)) return false;
+    return true;
+  }).slice().reverse();
+}
+
+function savedFilterForm(f) {
+  const opt = (value, current, label) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
+  return `<form method="GET" action="/b/${esc(BRIDGE_TOKEN)}" style="margin:0 0 16px">
+  <input type="hidden" name="view" value="saved">
+  <label>Tìm: <input name="q" type="text" value="${esc(f.q)}" placeholder="từ khóa trong tin…" style="width:200px"></label>
+  <label> Người gửi: <select name="fsender">${opt('', f.sender, '— tất cả —')}${SENDERS.map((s) => opt(s, f.sender, s)).join('')}</select></label>
+  <label> Loại: <select name="fkind">${opt('all', f.kind, 'Đã ghim + Quyết định')}${opt('pinned', f.kind, 'Chỉ tin đã ghim')}${opt('decision', f.kind, 'Chỉ quyết định')}</select></label>
+  <button type="submit">Tìm</button>
+  <a href="/b/${esc(BRIDGE_TOKEN)}?view=saved">Xóa lọc</a>
+</form>`;
+}
+
+// Chế độ xem "Đã ghim & Quyết định" (v1.8.0): toàn bộ tin đã lưu, hiện
+// đủ nội dung bằng renderRow (kèm nút Ghim/Bỏ ghim + thao tác nhanh),
+// mỗi tin có link #msg-<id> về thread. Trống thì báo rõ, không giấu.
+function renderSaved(filters) {
+  const list = filterSaved(filters);
+  const pinnedCount = messages.filter((m) => m.pinned).length;
+  const decisionCount = messages.filter((m) => m.type === 'decision').length;
+  const rows = list.map(renderRow).join('')
+    || '<p><i>Không tìm thấy tin nào khớp. Thử xóa từ khóa hoặc đổi bộ lọc.</i></p>';
+  return `<h2>📌 Đã ghim &amp; Quyết định (${list.length} tin)</h2>
+<p style="color:#888;font-size:12px">Đã ghim: ${pinnedCount} tin · Quyết định đã chốt: ${decisionCount} tin. Bấm số tin để về thread.</p>
+${savedFilterForm(filters)}
+${rows}`;
+}
+
 async function renderPage(query) {
-  const view = query.get('view') === 'kanban' ? 'kanban' : 'thread';
+  const view = query.get('view') === 'kanban' ? 'kanban'
+    : query.get('view') === 'saved' ? 'saved' : 'thread';
   const filters = {
     assignee: query.get('fassignee') || '',
     status: query.get('fstatus') || '',
     deadline: query.get('fdeadline') || 'all',
   };
+  const savedFilters = {
+    q: query.get('q') || '',
+    sender: query.get('fsender') || '',
+    kind: ['pinned', 'decision'].includes(query.get('fkind')) ? query.get('fkind') : 'all',
+  };
   const status = await getBoardStatus();
   const rows = messages.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B và Muse C.</i></p>';
-  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`}</p>`;
+  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`} · ${view === 'saved' ? '<b>📌 Đã ghim</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=saved">📌 Đã ghim</a>`}</p>`;
   const main = view === 'kanban'
     ? `${filterForm(filters)}${renderKanban(filters)}`
-    : `<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
+    : view === 'saved'
+      ? renderSaved(savedFilters)
+      : `<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
 <div id="thread">
 ${rows}
 </div>`;
@@ -1527,11 +1592,11 @@ html{scroll-behavior:smooth}
 ${renderStatusPanel(status)}
 <p>Presence: ${presenceStatus().map((p) => `${p.muse} ${p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : 'online ' + p.agoMinutes + ' phút trước')}`).join(' · ')}</p>
 <p>Tóm tắt: ${esc(buildRollingSummary().text)}</p>
-${renderWhatsNew()}
+${view === 'saved' ? '' : renderWhatsNew()}
 <p>Đang ở đây: <span id="presence-avatars">${renderPresenceAvatars()}</span></p>
 <p id="typing-line" style="color:#888;font-size:13px;min-height:18px;margin:4px 0"></p>
 <p>Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT'}</p>
-${renderTopSections()}
+${view === 'saved' ? '' : renderTopSections()}
 <p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
 ${viewToggle}
 ${main}
@@ -1585,7 +1650,7 @@ ${main}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -2282,6 +2347,31 @@ ${wdRows}
     });
   }
 
+  // Đã ghim & Quyết định — tra cứu riêng (v1.8.0):
+  // GET /api/pinned?token=... — toàn bộ tin đã ghim (cờ pinned, v1.7.0),
+  // mới nhất trước. GET /api/decisions?token=&q=&sender= — tin
+  // type=decision (v1.5.0), lọc theo từ khóa q (không phân biệt hoa
+  // thường) và người gửi sender; dùng chung filterSaved với board
+  // ?view=saved nên kết quả API và board luôn khớp nhau.
+  if (p === '/api/pinned' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, count: filterSaved({ kind: 'pinned' }).length, pinned: filterSaved({ kind: 'pinned' }) });
+  }
+
+  if (p === '/api/decisions' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const list = filterSaved({
+      kind: 'decision',
+      q: url.searchParams.get('q') || '',
+      sender: url.searchParams.get('sender') || '',
+    });
+    return json(res, 200, {
+      ok: true, count: list.length,
+      q: url.searchParams.get('q') || '', sender: url.searchParams.get('sender') || '',
+      decisions: list,
+    });
+  }
+
   // Heartbeat + catch-up (v1.4.0): POST /api/heartbeat {"token","sender",
   // "lastSeenId"} — ghi check-in; nếu Muse quay lại sau hơn
   // PRESENCE_DIGEST_MINUTES phút thì trả kèm digest các tin chưa đọc.
@@ -2450,7 +2540,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Mentions + read receipts: BẬT — @muse-a|muse-b|muse-c, POST /api/messages/:id/read, GET /api/messages?for= / ?unread_by=`);
   console.log(`Rolling summary + since-delta: BẬT — GET /api/since?sender=&since= (tóm tắt lăn + tin mới + task đang mở)`);
   console.log(`Board v1.7.0: Kanban + lọc task (?view=kanban), thẻ GitHub mở rộng, panel trạng thái (/api/board-status), ghim tin + bảng Quyết định (POST /api/messages/:id/pin)`);
-  console.log(`Board v1.7.0: panel "Có gì mới" + thao tác nhanh + command palette (Ctrl+K) + typing indicator (POST /api/typing, SSE event typing)`);
+  console.log(`Board v1.8.0: chế độ xem "Đã ghim & Quyết định" (?view=saved&q=&fsender=&fkind=) + GET /api/pinned + GET /api/decisions?q=&sender=`);
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();

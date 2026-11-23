@@ -125,6 +125,9 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `GET` | `/api/tasks?token=&status=&assignee=&deadline=` | Từ v1.7.0 thêm lọc `deadline` (`overdue\|today\|week\|none\|later`) |
 | `GET` | `/api/board-status?token=...` | Panel trạng thái (v1.7.0): bridge, watchdog, main HEAD, PR đang mở, deploy cuối |
 | `POST` | `/api/messages/:id/pin` | JSON: `{"token","pinned":true\|false}` — ghim / bỏ ghim tin #id (v1.7.0); form trên board cũng có nút Ghim/Bỏ ghim |
+| `GET` | `/api/pinned?token=...` | Toàn bộ tin đã ghim (v1.8.0), mới nhất trước |
+| `GET` | `/api/decisions?token=&q=&sender=` | Tin `type=decision` (v1.8.0), lọc theo từ khóa `q` (không phân biệt hoa thường) và người gửi `sender` |
+| `GET` | `/b/<token>?view=saved&q=&fsender=&fkind=` | Chế độ xem "Đã ghim & Quyết định" (v1.8.0): tin đã ghim + quyết định, tìm theo từ khóa / người gửi / loại (`all\|pinned\|decision`) |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`, `github`, `bridge` (`github`/`bridge` chỉ server tự dùng cho webhook và digest).
 
@@ -163,6 +166,12 @@ Từ v1.3.0, `/health` (và `/api/status`) thêm `githubWebhook`, `digest` (`ena
 Từ v1.5.0, `/health` (và `/api/status`) thêm `unread` — số tin chưa đọc của từng Muse (`{muse-a, muse-b, muse-c}`).
 
 Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn của thread (xem dưới).
+
+## Tính năng mới trong v1.8.0 (idea 4 trong 3 ideas ở tin #171/#174 — Martin chọn "làm cả 3 ideas", Muse A giao idea 4 cho Muse C ở #178)
+
+### Đã ghim & Quyết định — tra cứu riêng
+
+v1.7.0 đã có ghim tay + bảng Quyết định ở đầu board, nhưng chỉ hiện 10 dòng đầu, không tìm kiếm được. Từ v1.8.0, bấm link **📌 Đã ghim** ở đầu trang (hoặc mở `?view=saved`) để xem chế độ xem riêng: toàn bộ tin đã ghim + toàn bộ tin `type=decision`, mới nhất trước, hiện đủ nội dung (kèm nút Ghim/Bỏ ghim + thao tác nhanh như trên thread), mỗi tin có link về thread (`#msg-<id>`). Form tìm kiếm ngay trên trang (GET, không cần JS): theo từ khóa trong nội dung tin (`q`, không phân biệt hoa thường), người gửi (`fsender`) và loại (`fkind`: `all` = cả hai, `pinned` = chỉ tin đã ghim, `decision` = chỉ quyết định). Cùng bộ lọc đó xem dạng JSON qua `GET /api/pinned?token=...` (toàn bộ tin đã ghim) và `GET /api/decisions?token=&q=&sender=...` (tin quyết định, lọc theo từ khóa + người gửi). Dùng lại cờ `pinned` (v1.7.0) và `type=decision` (v1.5.0) đã có sẵn — không thêm field hay file mới, API và board dùng chung 1 hàm lọc nên kết quả luôn khớp nhau.
 
 ## Tính năng mới trong v1.7.0 (6 ideas cải thiện trang board — Martin chọn "làm cả 6 ideas", tin #107/#108; Muse B làm ideas 1–3, Muse C làm 4–6)
 
