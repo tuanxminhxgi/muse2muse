@@ -114,14 +114,41 @@ async function sendToTelegram(text) {
 // Poll getUpdates, ingest Martin's Telegram messages into the mailbox.
 // Loop-safe: messages the bridge itself sent via sendMessage do NOT come
 // back through getUpdates, and we ignore any message from a bot.
+//
+// BUG FIX 2026-11-23 (409 Conflict): pollTelegram used to run on
+// setInterval(..., 2000) with no in-flight guard. pollTelegram is async,
+// so if one fetch to api.telegram.org took >2s, the next tick started a
+// SECOND concurrent getUpdates while the first was still pending — and
+// Telegram answers that with 409 "terminated by other getUpdates request".
+// That 409 then kept repeating even with only ONE server process running.
+// Fix: poll sequentially — schedule the next poll only AFTER the previous
+// one finishes (setTimeout in finally), plus an in-flight guard, and back
+// off 5s after a 409 so Telegram's lock can clear.
 let tgOffset = 0;
 let tgSeen = new Set();
+let tgPolling = false;
+let tgNextDelayMs = TELEGRAM_POLL_MS;
+function schedulePoll() {
+  if (!telegramEnabled) return;
+  setTimeout(pollTelegram, tgNextDelayMs);
+  tgNextDelayMs = TELEGRAM_POLL_MS; // reset unless the next poll sets a backoff
+}
 async function pollTelegram() {
   if (!telegramEnabled) return;
+  if (tgPolling) return; // never run two getUpdates at once, even if called twice
+  tgPolling = true;
   try {
     const url = tgApi('getUpdates') + `?timeout=0&offset=${tgOffset}`;
     const res = await fetch(url);
-    if (!res.ok) { console.error('[telegram] getUpdates failed:', res.status); return; }
+    if (!res.ok) {
+      const body = await res.text().then((t) => t.slice(0, 200)).catch(() => '');
+      console.error('[telegram] getUpdates failed:', res.status, body);
+      // 409 = another getUpdates is in flight (old server still running,
+      // a browser tab on getUpdates, or a stale lock). Wait longer before
+      // retrying instead of hammering every 2s.
+      if (res.status === 409) tgNextDelayMs = 5000;
+      return;
+    }
     const data = await res.json();
     for (const upd of data.result || []) {
       tgOffset = Math.max(tgOffset, upd.update_id + 1);
@@ -139,9 +166,13 @@ async function pollTelegram() {
     }
   } catch (e) {
     console.error('[telegram] poll error:', e.message);
+  } finally {
+    tgPolling = false;
+    schedulePoll(); // next poll only starts after this one fully finished
   }
 }
-if (telegramEnabled) setInterval(pollTelegram, TELEGRAM_POLL_MS);
+// No setInterval here on purpose: the loop is started once from
+// server.listen() below, and each poll schedules the next one itself.
 
 // ---------- HTML ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
