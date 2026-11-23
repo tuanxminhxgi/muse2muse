@@ -128,6 +128,35 @@
 //   &sender= (tin type=decision, lọc theo từ khóa + người gửi). Dùng lại
 //   cờ pinned và type=decision đã có từ v1.7.0/v1.5.0, không thêm field
 //   hay file mới.
+// v1.9.0 (Muse B: ideas 3 + 4 trong 5 ideas nâng cấp hệ thống, tin #164/
+// #165/#171/#174/#178 — Martin chọn ideas 3, 4, 5, Muse A giao 3 + 4
+// cho Muse B, idea 5 cho Muse C; Martin xác nhận ở #111. PR #13 gốc bị
+// conflict sau khi PR #12 của Muse C (saved view, v1.8.0) merge trước
+// nên nội dung được merge lại lên main 8d7554f71 và mở PR mới):
+//   1) Task lifecycle đầy đủ: claim → doing → review → done. Task có
+//      trạng thái mới 'review'; chuyển trạng thái chỉ theo các bước cho
+//      phép (todo→doing/blocked, doing→review/blocked/todo,
+//      review→done/doing/blocked, blocked→todo/doing, done→todo để mở
+//      lại). Claim khóa task cho 1 Muse (lockedBy + lockedAt, lưu ngay
+//      trên task); Muse khác không đổi trạng thái/giao việc khi khóa còn
+//      hiệu lực (trả 409), Martin thì luôn được. Khóa hết hạn sau
+//      TASK_LOCK_TIMEOUT_MINUTES phút không hoạt động thì server tự nhả
+//      và đăng tin mở lại task. Task xong (done) hoặc quay về todo thì
+//      tự nhả khóa. Nhắc task quá hạn / hạn hôm nay: mỗi ngày 1 lần,
+//      gom chung 1 tin (task.remindedAt ghi ngày đã nhắc).
+//   2) Duyệt nhanh trên Telegram: tin PR (GitHub webhook) có nút inline
+//      ✅ Duyệt / 🔀 Merge. Duyệt ghi quyết định lên thread (type
+//      decision) để cả 3 Muse thấy. Merge chỉ merge thật khi đã đặt
+//      GITHUB_TOKEN (PAT của Martin, repo scope) — chưa đặt thì nút ghi
+//      quyết định "Martin yêu cầu merge" + trả link để Martin merge tay
+//      trên GitHub. Lệnh /approve <n> và /merge <n> làm việc tương tự.
+//      Cờ kiểm tra rủi ro phía Muse (execution-risk flag) vẫn cần lời
+//      xác nhận trực tiếp của Martin — nút Telegram không bấm hộ được.
+//
+// Ghi chú: lúc làm v1.9.0, nội dung repo lại bị gắn cờ execution-risk
+// (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
+// board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
+//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -141,7 +170,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -197,6 +226,15 @@ const PRESENCE_OFFLINE_MINUTES = Number(process.env.PRESENCE_OFFLINE_MINUTES || 
 const PRESENCE_DIGEST_MINUTES = Number(process.env.PRESENCE_DIGEST_MINUTES || 10);
 // Lệnh Telegram quản lý task (v1.4.0): TELEGRAM_COMMANDS_ENABLED=0 tắt hẳn.
 const TELEGRAM_COMMANDS_ENABLED = (process.env.TELEGRAM_COMMANDS_ENABLED || 'true').toLowerCase() !== 'false';
+// Task lifecycle (v1.9.0): khóa task hết hạn sau TASK_LOCK_TIMEOUT_MINUTES
+// phút không hoạt động (0 = khóa không bao giờ hết hạn); nhắc task quá
+// hạn / hạn hôm nay mỗi ngày 1 lần, TASK_REMINDER_ENABLED=0 tắt hẳn.
+const TASK_LOCK_TIMEOUT_MINUTES = Number(process.env.TASK_LOCK_TIMEOUT_MINUTES || 60);
+const TASK_REMINDER_ENABLED = (process.env.TASK_REMINDER_ENABLED || 'true').toLowerCase() !== 'false';
+// Duyệt nhanh PR trên Telegram (v1.9.0): GITHUB_TOKEN là PAT của Martin
+// (repo scope). Chỉ dùng để merge PR khi Martin bấm nút 🔀 Merge / gõ
+// /merge — không có token thì nút chỉ ghi quyết định + trả link merge tay.
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
 const MUSES = ['muse-a', 'muse-b', 'muse-c'];
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -205,7 +243,9 @@ const SENDERS = ['muse-a', 'muse-b', 'muse-c', 'martin', 'user', 'telegram', 'gi
 // 'github' = tin tự động từ GitHub webhook; 'bridge' = digest/nhắc việc tự động.
 // Hai sender này chỉ server tự dùng, không có trong form gửi tay trên board.
 const TASK_ASSIGNEES = ['muse-a', 'muse-b', 'muse-c', 'martin'];
-const TASK_STATUSES = ['todo', 'doing', 'done', 'blocked'];
+// Trạng thái task (v1.9.0 thêm 'review'): claim → doing → review → done.
+// Xem TASK_TRANSITIONS bên dưới — chỉ chuyển theo các bước cho phép.
+const TASK_STATUSES = ['todo', 'doing', 'review', 'done', 'blocked'];
 // Tin có cấu trúc (v1.5.0): type phân loại tin; reply_to trỏ tới tin được
 // trả lời; deadline (trong task) là hạn chót ISO date. @mention nhắc đúng
 // Muse cần đọc — MENTIONABLES gồm cả martin để hiện chip trên board, còn
@@ -381,7 +421,9 @@ function persistMessages() {
 }
 
 // ---------- Task tracking (v1.1.0) + tin có cấu trúc (v1.5.0) ----------
-// task: {assignee: muse-a|muse-b|muse-c|martin|null, status: todo|doing|done|blocked, deadline?: ISO date}
+// task: {assignee: muse-a|muse-b|muse-c|martin|null, status: todo|doing|review|done|blocked, deadline?: ISO date}
+// lockedBy/lockedAt/remindedAt (v1.9.0) lưu kèm trên task, không đặt lúc tạo
+// task mới — chỉ claim/release/sweep mới ghi.
 // deadline (v1.5.0): chuỗi ngày ISO (YYYY-MM-DD hoặc đầy đủ), phải parse
 // được; sai định dạng thì throw để caller trả 400.
 // Returns a normalized task object, or null when no task was given.
@@ -399,7 +441,7 @@ function normalizeTask(input) {
     throw new Error('assignee must be muse-a|muse-b|muse-c|martin');
   }
   if (status !== null && !TASK_STATUSES.includes(status)) {
-    throw new Error('status must be todo|doing|done|blocked');
+    throw new Error('status must be todo|doing|review|done|blocked');
   }
   if (deadline !== null && Number.isNaN(Date.parse(deadline))) {
     throw new Error('deadline must be an ISO date, e.g. 2026-11-30');
@@ -439,6 +481,90 @@ function parseMentions(text) {
     if (!found.includes(name)) found.push(name);
   }
   return found;
+}
+
+// ---------- Task lifecycle (v1.9.0) ----------
+// task mở rộng (lưu ngay trên task trong messages.jsonl, tin cũ không có
+// các trường này vẫn đọc bình thường):
+//   lockedBy: muse-a|muse-b|muse-c|martin|null — ai đang giữ khóa task
+//   lockedAt: ISO time lúc claim — khóa hết hạn sau TASK_LOCK_TIMEOUT_MINUTES
+//   remindedAt: ngày YYYY-MM-DD đã nhắc task quá hạn / hạn hôm nay
+// Các bước chuyển trạng thái cho phép. Lệnh Telegram của Martin
+// (/done, /status) được quyền bỏ qua bảng này (Martin override); API
+// PATCH và nút Telegram thì phải theo bảng.
+const TASK_TRANSITIONS = {
+  todo: ['doing', 'blocked'],
+  doing: ['review', 'blocked', 'todo'],
+  review: ['done', 'doing', 'blocked'],
+  blocked: ['todo', 'doing'],
+  done: ['todo'], // mở lại task đã xong
+};
+const TASK_LOCK_TIMEOUT_MS = TASK_LOCK_TIMEOUT_MINUTES * 60_000;
+
+// Khóa còn hiệu lực không? Không có lockedBy = không khóa; hết hạn =
+// coi như không khóa (ai cũng claim lại được, sweep dọn sau).
+function lockStale(task) {
+  if (!task?.lockedBy || !task.lockedAt) return false;
+  if (!TASK_LOCK_TIMEOUT_MS) return false; // 0 = khóa không bao giờ hết hạn
+  return Date.now() - new Date(task.lockedAt).getTime() > TASK_LOCK_TIMEOUT_MS;
+}
+function lockAgeMin(task) {
+  if (!task?.lockedAt) return null;
+  return Math.floor((Date.now() - new Date(task.lockedAt).getTime()) / 60_000);
+}
+// Trả về lỗi khi caller không được sửa task đang bị khóa, ngược lại null.
+// Martin luôn được sửa; người giữ khóa được sửa; khóa hết hạn thì ai cũng được.
+function lockBlocks(task, caller) {
+  if (!task?.lockedBy) return null;
+  if (caller && (caller === task.lockedBy || caller === 'martin')) return null;
+  if (lockStale(task)) return null;
+  return `task đang bị ${task.lockedBy} giữ (khóa từ ${task.lockedAt}) — chờ hết hạn (${TASK_LOCK_TIMEOUT_MINUTES} phút không hoạt động) hoặc nhờ Martin nhả khóa`;
+}
+function checkTransition(task, nextStatus) {
+  const from = task?.status || 'todo';
+  if (from === nextStatus) return { ok: true };
+  const allowed = TASK_TRANSITIONS[from] || [];
+  if (!allowed.includes(nextStatus)) {
+    return { ok: false, error: `không đổi được ${from} → ${nextStatus} (cho phép: ${allowed.join(', ') || 'không có'})` };
+  }
+  return { ok: true };
+}
+// Nhận 1 task: khóa cho claimant, task todo thì chuyển sang doing.
+// Khóa của người khác còn hiệu lực thì trả 409 (code 'locked'); khóa hết
+// hạn thì claimant lấy lại được (tookOver=true). Task đã done thì không nhận.
+function claimTask(id, claimant, source) {
+  const msg = messages.find((m) => m.id === id);
+  if (!msg) return { ok: false, code: 'not_found', error: `không tìm thấy tin #${id}` };
+  if (!msg.task) return { ok: false, code: 'not_task', error: `tin #${id} không phải task` };
+  if (msg.task.status === 'done') return { ok: false, code: 'done', error: `task #${id} đã done, không nhận được nữa` };
+  const t = msg.task;
+  if (t.lockedBy && t.lockedBy !== claimant && !lockStale(t)) {
+    return { ok: false, code: 'locked', error: lockBlocks(t, claimant) };
+  }
+  const tookOver = Boolean(t.lockedBy && t.lockedBy !== claimant);
+  t.lockedBy = claimant;
+  t.lockedAt = new Date().toISOString();
+  if (t.status === 'todo') t.status = 'doing';
+  persistMessages();
+  appendAudit({ action: 'task.claim', sender: claimant, messageId: msg.id, source: source || 'api' });
+  return { ok: true, message: msg, tookOver };
+}
+// Nhả khóa 1 task: chỉ người giữ khóa hoặc Martin (hoặc khóa đã hết hạn).
+function releaseTask(id, caller, source) {
+  const msg = messages.find((m) => m.id === id);
+  if (!msg) return { ok: false, code: 'not_found', error: `không tìm thấy tin #${id}` };
+  if (!msg.task) return { ok: false, code: 'not_task', error: `tin #${id} không phải task` };
+  const t = msg.task;
+  if (!t.lockedBy) return { ok: false, code: 'not_locked', error: `task #${id} đang không bị khóa` };
+  if (t.lockedBy !== caller && caller !== 'martin' && !lockStale(t)) {
+    return { ok: false, code: 'locked', error: `chỉ ${t.lockedBy} hoặc Martin mới nhả được khóa của #${id}` };
+  }
+  const prevHolder = t.lockedBy;
+  delete t.lockedBy;
+  delete t.lockedAt;
+  persistMessages();
+  appendAudit({ action: 'task.release', sender: caller, messageId: msg.id, source: source || 'api' });
+  return { ok: true, message: msg, prevHolder };
 }
 
 function addMessage({ sender, text, source, task, type, reply_to, github }) {
@@ -577,7 +703,11 @@ const TASK_COMMANDS_HELP = [
   '/tasks — liệt kê task đang mở',
   '/done <id> — đánh dấu task #id là done',
   '/assign <id> <muse-a|muse-b|muse-c|martin> — giao task',
-  '/status <id> <todo|doing|done|blocked> — đổi trạng thái',
+  '/status <id> <todo|doing|review|done|blocked> — đổi trạng thái',
+  '/claim <id> — Martin nhận task (khóa cho Martin)',
+  '/release <id> — nhả khóa task',
+  '/approve <n> — duyệt PR #n của muse2muse (ghi quyết định lên thread)',
+  '/merge <n> — merge PR #n (cần GITHUB_TOKEN, chưa có thì trả link merge tay)',
   '/help — xem lại danh sách này',
 ].join('\n');
 
@@ -601,10 +731,27 @@ function parseTelegramCommand(text) {
   if (cmd === '/status' && parts.length === 3) {
     const id = Number(parts[1]);
     if (!Number.isInteger(id) || id <= 0) return { cmd: 'bad', error: 'id phải là số, ví dụ /status 12 doing' };
-    if (!TASK_STATUSES.includes(parts[2])) return { cmd: 'bad', error: 'status phải là todo|doing|done|blocked' };
+    if (!TASK_STATUSES.includes(parts[2])) return { cmd: 'bad', error: 'status phải là todo|doing|review|done|blocked' };
     return { cmd: 'status', id, status: parts[2] };
   }
-  if (['/tasks', '/done', '/assign', '/status', '/help'].includes(cmd)) {
+  if (cmd === '/claim' && parts.length === 2) {
+    const id = Number(parts[1]);
+    return Number.isInteger(id) && id > 0 ? { cmd: 'claim', id } : { cmd: 'bad', error: 'id phải là số, ví dụ /claim 12' };
+  }
+  if (cmd === '/release' && parts.length === 2) {
+    const id = Number(parts[1]);
+    return Number.isInteger(id) && id > 0 ? { cmd: 'release', id } : { cmd: 'bad', error: 'id phải là số, ví dụ /release 12' };
+  }
+  // /approve <n> hoặc /approve <owner/repo> <n> (mặc định repo muse2muse);
+  // tương tự /merge. Số PR phải là số nguyên dương.
+  if ((cmd === '/approve' || cmd === '/merge') && (parts.length === 2 || parts.length === 3)) {
+    const repo = parts.length === 3 ? parts[1] : 'tuanxminhxgi/muse2muse';
+    const number = Number(parts[parts.length - 1]);
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return { cmd: 'bad', error: 'repo phải dạng owner/repo, ví dụ /approve tuanxminhxgi/muse2muse 11' };
+    if (!Number.isInteger(number) || number <= 0) return { cmd: 'bad', error: 'số PR phải là số, ví dụ /approve 11' };
+    return { cmd: cmd.slice(1), repo, number };
+  }
+  if (['/tasks', '/done', '/assign', '/status', '/claim', '/release', '/approve', '/merge', '/help'].includes(cmd)) {
     return { cmd: 'bad', error: `sai cú pháp. Gõ /help để xem cách dùng.` };
   }
   return null; // lệnh lạ (không phải của bridge) — bỏ qua, không đưa vào mailbox
@@ -623,17 +770,45 @@ function listOpenTasksText() {
 
 // Nút inline dưới tin task trên Telegram: callback_data 'task:<id>:<status>'
 // hoặc 'assign:<id>:<muse>'. Telegram gửi callback_query về cho pollTelegram.
+// Từ v1.9.0 thêm hàng Nhận việc / Nhả việc (claim:<id> / release:<id>) để
+// Martin khóa / nhả task ngay trong Telegram.
 function taskKeyboard(msg) {
   if (!msg.task) return null;
   const id = msg.id;
-  const statusRow = [
-    { text: 'Todo', callback_data: `task:${id}:todo` },
-    { text: 'Doing', callback_data: `task:${id}:doing` },
-    { text: 'Done', callback_data: `task:${id}:done` },
-    { text: 'Blocked', callback_data: `task:${id}:blocked` },
-  ];
+  const statusRow = TASK_STATUSES.map((st) => ({ text: st[0].toUpperCase() + st.slice(1), callback_data: `task:${id}:${st}` }));
   const assignRow = ['muse-a', 'muse-b', 'muse-c'].map((muse) => ({ text: muse, callback_data: `assign:${id}:${muse}` }));
-  return { inline_keyboard: [statusRow, assignRow] };
+  const claimRow = [
+    { text: '🙋 Nhận việc', callback_data: `claim:${id}` },
+    { text: '🔓 Nhả việc', callback_data: `release:${id}` },
+  ];
+  return { inline_keyboard: [statusRow, assignRow, claimRow] };
+}
+
+// Nút inline dưới tin PR trên Telegram (v1.9.0): ✅ Duyệt ghi quyết định
+// lên thread; 🔀 Merge merge thật chỉ khi đã đặt GITHUB_TOKEN (xem
+// handlePrApproval), chưa đặt thì ghi quyết định + trả link merge tay.
+// Chỉ gắn khi PR còn mở (action opened/reopened/ready_for_review/
+// synchronize, chưa merged); PR đã đóng/merge thì không có nút.
+function prKeyboard(msg) {
+  const g = msg.github;
+  if (!g || typeof g !== 'object' || g.event !== 'pull_request' || g.number == null) return null;
+  if (g.merged) return null;
+  if (!['opened', 'reopened', 'ready_for_review', 'synchronize'].includes(g.action)) return null;
+  const repo = g.repo || 'tuanxminhxgi/muse2muse';
+  return {
+    inline_keyboard: [[
+      { text: '✅ Duyệt PR', callback_data: `pr:${repo}:${g.number}:approve` },
+      { text: '🔀 Merge PR', callback_data: `pr:${repo}:${g.number}:merge` },
+    ]],
+  };
+}
+
+// Gộp 2 bàn phím inline (task + PR) thành 1, để 1 tin vừa có nút task vừa
+// có nút PR khi cần. Tin nào không có nút thì trả null như cũ.
+function mergeKeyboards(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return { inline_keyboard: [...a.inline_keyboard, ...b.inline_keyboard] };
 }
 
 function parseCallbackData(data) {
@@ -646,18 +821,38 @@ function parseCallbackData(data) {
     const id = Number(parts[1]);
     if (Number.isInteger(id) && id > 0) return { kind: 'assign', id, assignee: parts[2] };
   }
+  if ((parts[0] === 'claim' || parts[0] === 'release') && parts.length === 2) {
+    const id = Number(parts[1]);
+    if (Number.isInteger(id) && id > 0) return { kind: parts[0], id };
+  }
+  if (parts[0] === 'pr' && parts.length === 4 && /^[\w.-]+\/[\w.-]+$/.test(parts[1])
+    && ['approve', 'merge'].includes(parts[3])) {
+    const number = Number(parts[2]);
+    if (Number.isInteger(number) && number > 0) return { kind: 'pr', repo: parts[1], number, action: parts[3] };
+  }
   return null;
 }
 
 // Áp dụng 1 thay đổi task; trả về {ok, message?, error?}. Không tự đăng tin
-// — caller đăng tin xác nhận sau khi áp xong.
-function applyTaskUpdate({ id, status, assignee }) {
+// — caller đăng tin xác nhận sau khi áp xong. opts.enforceTransitions
+// (mặc định true): false khi lệnh đến từ Martin trên Telegram (/done,
+// /status) — Martin được quyền bỏ qua bảng chuyển trạng thái. Task xong
+// (done) hoặc quay về todo thì tự nhả khóa.
+function applyTaskUpdate({ id, status, assignee }, opts = {}) {
   const msg = messages.find((m) => m.id === id);
   if (!msg) return { ok: false, error: `không tìm thấy tin #${id}` };
   if (!msg.task) return { ok: false, error: `tin #${id} không phải task` };
+  if (status !== undefined && opts.enforceTransitions !== false) {
+    const t = checkTransition(msg.task, status);
+    if (!t.ok) return { ok: false, error: t.error };
+  }
   const next = { ...msg.task };
   if (status !== undefined) next.status = status;
   if (assignee !== undefined) next.assignee = assignee;
+  if (next.status === 'done' || next.status === 'todo') {
+    delete next.lockedBy;
+    delete next.lockedAt;
+  }
   msg.task = next;
   persistMessages();
   appendAudit({ action: 'task.update', sender: 'martin', messageId: msg.id, source: 'telegram' });
@@ -672,7 +867,27 @@ async function handleTelegramCommand(parsed) {
   if (parsed.cmd === 'help') return TASK_COMMANDS_HELP;
   if (parsed.cmd === 'tasks') return listOpenTasksText();
   if (parsed.cmd === 'bad') return parsed.error;
-  const r = applyTaskUpdate(parsed);
+  if (parsed.cmd === 'approve' || parsed.cmd === 'merge') {
+    const r = await handlePrApproval({ repo: parsed.repo, number: parsed.number, action: parsed.cmd, via: `lệnh /${parsed.cmd}` });
+    return r.reply;
+  }
+  if (parsed.cmd === 'claim' || parsed.cmd === 'release') {
+    const r = parsed.cmd === 'claim'
+      ? claimTask(parsed.id, 'martin', 'telegram')
+      : releaseTask(parsed.id, 'martin', 'telegram');
+    if (!r.ok) return r.error;
+    const m = r.message;
+    const confirm = parsed.cmd === 'claim'
+      ? `[telegram] Martin đã nhận task #${m.id} [${m.task.status} · 🔒 martin]: ${String(m.text).split('\n')[0].slice(0, 100)}`
+      : `[telegram] Martin đã nhả khóa task #${m.id} [${m.task.status}]: ${String(m.text).split('\n')[0].slice(0, 100)}`;
+    const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
+    console.log(`[telegram] command #${msg.id} ${parsed.cmd} #${m.id}`);
+    return confirm;
+  }
+  // Sửa lỗi có từ v1.4.0: /done parse ra {cmd:'done', id} mà không có
+  // status, nên applyTaskUpdate không đổi gì nhưng vẫn đăng tin "đã xong".
+  // Ép status:'done' ở đây để /done thật sự đánh dấu xong.
+  const r = applyTaskUpdate(parsed.cmd === 'done' ? { ...parsed, status: 'done' } : parsed, { enforceTransitions: false }); // Martin override
   if (!r.ok) return r.error;
   const m = r.message;
   const what = parsed.cmd === 'done'
@@ -684,6 +899,63 @@ async function handleTelegramCommand(parsed) {
   const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
   console.log(`[telegram] command #${msg.id} ${parsed.cmd} #${m.id}`);
   return confirm;
+}
+
+// ---------- Duyệt nhanh PR trên Telegram (v1.9.0) ----------
+// Nút ✅ Duyệt / 🔀 Merge dưới tin PR (xem prKeyboard) và lệnh /approve,
+// /merge đều đi qua đây. Duyệt chỉ ghi quyết định lên thread (type
+// decision) để cả 3 Muse thấy — không cần GitHub. Merge thật chỉ khi đã
+// đặt GITHUB_TOKEN (PAT của Martin, repo scope): gọi GitHub API merge;
+// chưa đặt token thì ghi quyết định "Martin yêu cầu merge" + trả link để
+// Martin merge tay trên GitHub. Cờ kiểm tra rủi ro phía Muse thì nút
+// không bấm hộ được — vẫn cần lời xác nhận trực tiếp của Martin.
+async function mergePullRequest(repo, number) {
+  if (!GITHUB_TOKEN) return { ok: false, error: 'chưa đặt GITHUB_TOKEN trong .env' };
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${number}/merge`, {
+      method: 'PUT',
+      headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${GITHUB_TOKEN}`, 'user-agent': 'muse-bridge' },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) return { ok: true, sha: data.sha || null, message: data.message || 'Merged' };
+    return { ok: false, error: data.message || `GitHub trả ${res.status}` };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function handlePrApproval({ repo, number, action, via }) {
+  const url = `https://github.com/${repo}/pull/${number}`;
+  if (action === 'approve') {
+    const text = `[telegram] Martin đã duyệt PR #${number} (${repo})${via ? ` (${via})` : ''} — quyết định đã ghi lên thread, merge vẫn do Martin bấm trên GitHub hoặc nút Merge.\n${url}`;
+    const msg = addMessage({ sender: 'martin', text, source: 'telegram', type: 'decision' });
+    appendAudit({ action: 'pr.approve', sender: 'martin', messageId: msg.id, source: 'telegram' });
+    console.log(`[telegram] approve #${msg.id} PR ${repo}#${number}`);
+    return { ok: true, reply: `Đã ghi nhận: duyệt PR #${number} (${repo}). Merge vẫn cần bấm trên GitHub hoặc nút Merge.`, boardMessage: msg };
+  }
+  // action === 'merge'
+  if (!GITHUB_TOKEN) {
+    const text = `[telegram] Martin bấm Merge cho PR #${number} (${repo})${via ? ` (${via})` : ''} — bridge chưa có GITHUB_TOKEN nên chưa merge tự động được. Merge tại: ${url}`;
+    const msg = addMessage({ sender: 'martin', text, source: 'telegram', type: 'decision' });
+    appendAudit({ action: 'pr.merge.requested', sender: 'martin', messageId: msg.id, source: 'telegram' });
+    console.log(`[telegram] merge requested (no token) #${msg.id} PR ${repo}#${number}`);
+    return { ok: false, reply: `Bridge chưa có GITHUB_TOKEN nên chưa merge PR #${number} tự động được. Merge tại: ${url}`, boardMessage: msg };
+  }
+  const r = await mergePullRequest(repo, number);
+  if (r.ok) {
+    const text = `[telegram] Martin đã merge PR #${number} (${repo}) qua Telegram${via ? ` (${via})` : ''} — GitHub xác nhận đã merge${r.sha ? ` (${String(r.sha).slice(0, 7)})` : ''}.\n${url}`;
+    const msg = addMessage({ sender: 'martin', text, source: 'telegram', type: 'decision' });
+    appendAudit({ action: 'pr.merge', sender: 'martin', messageId: msg.id, source: 'telegram' });
+    console.log(`[telegram] merged #${msg.id} PR ${repo}#${number}`);
+    return { ok: true, reply: `Đã merge PR #${number} (${repo}).`, boardMessage: msg };
+  }
+  const text = `[telegram] Martin bấm Merge cho PR #${number} (${repo})${via ? ` (${via})` : ''} nhưng GitHub báo lỗi: ${r.error}. Merge tay tại: ${url}`;
+  const msg = addMessage({ sender: 'martin', text, source: 'telegram', type: 'decision' });
+  appendAudit({ action: 'pr.merge.failed', sender: 'martin', messageId: msg.id, source: 'telegram' });
+  console.log(`[telegram] merge failed #${msg.id} PR ${repo}#${number}: ${r.error}`);
+  return { ok: false, reply: `Merge PR #${number} thất bại: ${r.error}. Merge tay tại: ${url}`, boardMessage: msg };
 }
 
 // ---------- Offline outbox (v1.1.0) ----------
@@ -726,7 +998,7 @@ async function forwardToTelegram(msg) {
   const taskSuffix = msg.task
     ? ` [${msg.task.status || 'todo'}${msg.task.assignee ? ' · ' + msg.task.assignee : ''}${msg.task.deadline ? ' · hạn ' + msg.task.deadline : ''}]` : '';
   const text = `${mentionPrefix}[${msg.sender}]${taskSuffix} ${msg.text}`;
-  const ok = await sendToTelegram(text, taskKeyboard(msg));
+  const ok = await sendToTelegram(text, mergeKeyboards(taskKeyboard(msg), prKeyboard(msg)));
   if (ok) {
     markDelivered(msg, true);
   } else {
@@ -834,6 +1106,12 @@ async function getBoardStatus() {
       lastDeployAt: deployState.lastDeployAt,
       lastDeploySha: deployState.lastDeploySha,
       lastDeployResult: deployState.lastDeployResult,
+    },
+    lifecycle: {
+      lockTimeoutMinutes: TASK_LOCK_TIMEOUT_MINUTES,
+      reminderEnabled: TASK_REMINDER_ENABLED,
+      lockedTasks: messages.filter((m) => m.task?.lockedBy && !lockStale(m.task)).length,
+      staleLocks: messages.filter((m) => m.task?.lockedBy && lockStale(m.task)).length,
     },
     presence: presenceStatus(),
   };
@@ -1048,6 +1326,14 @@ function buildDigestText() {
   if (stale.length > 0) {
     lines.push('', `Nhắc: ${stale.length} task quá ${DIGEST_REMINDER_HOURS}h chưa cập nhật: ${stale.map((m) => `#${m.id}`).join(', ')}`);
   }
+  const overdue = open.filter((m) => deadlineBucket(m) === 'overdue');
+  const dueToday = open.filter((m) => deadlineBucket(m) === 'today');
+  if (overdue.length > 0) {
+    lines.push('', `Quá hạn: ${overdue.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  }
+  if (dueToday.length > 0) {
+    lines.push(`Hạn hôm nay: ${dueToday.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  }
   return lines.join('\n');
 }
 
@@ -1082,6 +1368,57 @@ function checkDigestDue() {
   } catch (e) {
     console.error('[digest] error:', e.message);
   }
+}
+
+// ---------- Task lifecycle sweeps (v1.9.0) ----------
+// Chạy mỗi phút (xem server.listen): (1) nhả các khóa task đã hết hạn —
+// mỗi khóa chỉ đăng 1 tin mở lại duy nhất vì sau khi nhả thì lockedBy
+// đã mất; (2) nhắc task quá hạn / hạn hôm nay — mỗi task chỉ nhắc 1 lần
+// / ngày (ghi task.remindedAt), gom chung 1 tin.
+function sweepTaskLocks() {
+  const released = [];
+  for (const m of messages) {
+    const t = m.task;
+    if (!t || !t.lockedBy || !lockStale(t)) continue;
+    const holder = t.lockedBy;
+    const ageMin = lockAgeMin(t);
+    delete t.lockedBy;
+    delete t.lockedAt;
+    released.push({ id: m.id, holder, ageMin, text: m.text });
+  }
+  if (released.length === 0) return;
+  persistMessages();
+  for (const r of released) {
+    appendAudit({ action: 'task.lock.timeout', sender: 'bridge', messageId: r.id, source: 'lifecycle' });
+  }
+  const lines = released.map((r) => `#${r.id} (đang do ${r.holder} giữ, ${r.ageMin} phút không hoạt động): ${String(r.text).split('\n')[0].slice(0, 80)}`);
+  const msg = addMessage({ sender: 'bridge', text: `[bridge] Khóa task đã hết hạn (${TASK_LOCK_TIMEOUT_MINUTES} phút không hoạt động) — đã mở lại để Muse khác nhận:\n${lines.join('\n')}`, source: 'task-lifecycle' });
+  console.log(`[lifecycle] released ${released.length} stale lock(s) as #${msg.id}`);
+  forwardToTelegram(msg);
+}
+
+function sweepTaskReminders() {
+  if (!TASK_REMINDER_ENABLED) return;
+  const today = localDayKey();
+  const overdue = [];
+  const dueToday = [];
+  for (const m of messages) {
+    const t = m.task;
+    if (!t || (t.status !== 'todo' && t.status !== 'doing')) continue;
+    if (t.remindedAt === today) continue; // đã nhắc hôm nay
+    const bucket = deadlineBucket(m);
+    if (bucket === 'overdue') overdue.push(m);
+    else if (bucket === 'today') dueToday.push(m);
+  }
+  if (overdue.length === 0 && dueToday.length === 0) return;
+  const lines = [];
+  if (overdue.length > 0) lines.push(`Quá hạn (${overdue.length}): ${overdue.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  if (dueToday.length > 0) lines.push(`Hạn hôm nay (${dueToday.length}): ${dueToday.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  for (const m of [...overdue, ...dueToday]) m.task.remindedAt = today;
+  const msg = addMessage({ sender: 'bridge', text: `[bridge] Nhắc task sắp hết hạn / quá hạn:\n${lines.join('\n')}`, source: 'task-lifecycle' });
+  persistMessages();
+  console.log(`[lifecycle] reminder #${msg.id} (overdue ${overdue.length}, due today ${dueToday.length})`);
+  forwardToTelegram(msg);
 }
 
 // Poll getUpdates, ingest Martin's Telegram messages into the mailbox.
@@ -1136,13 +1473,44 @@ async function pollTelegram() {
         if (!TELEGRAM_COMMANDS_ENABLED) continue;
         const parsed = parseCallbackData(cq.data);
         if (!parsed) continue;
+        const answerCallback = async (text) => {
+          try { await fetch(tgApi('answerCallbackQuery'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callback_query_id: cq.id, text: String(text || '').slice(0, 200) }) }); } catch {}
+        };
+        // Nút PR (v1.9.0): ✅ Duyệt / 🔀 Merge — xem handlePrApproval.
+        if (parsed.kind === 'pr') {
+          const r = await handlePrApproval({ repo: parsed.repo, number: parsed.number, action: parsed.action, via: 'nút Telegram' });
+          await answerCallback(r.ok ? 'Đã ghi nhận' : 'Chưa merge được — xem thread');
+          if (r.reply) await sendToTelegram(r.reply);
+          continue;
+        }
+        // Nút Nhận việc / Nhả việc (v1.9.0): Martin khóa / nhả task.
+        if (parsed.kind === 'claim' || parsed.kind === 'release') {
+          const r = parsed.kind === 'claim'
+            ? claimTask(parsed.id, 'martin', 'telegram')
+            : releaseTask(parsed.id, 'martin', 'telegram');
+          if (r.ok) {
+            const m = r.message;
+            const confirm = parsed.kind === 'claim'
+              ? `[telegram] Martin đã nhận task #${m.id} [${m.task.status} · 🔒 martin] (nút Telegram): ${String(m.text).split('\n')[0].slice(0, 100)}`
+              : `[telegram] Martin đã nhả khóa task #${m.id} [${m.task.status}] (nút Telegram): ${String(m.text).split('\n')[0].slice(0, 100)}`;
+            const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
+            console.log(`[telegram] callback #${msg.id} ${parsed.kind} #${m.id}`);
+            await answerCallback('Đã cập nhật');
+          } else {
+            await answerCallback(r.error);
+            await sendToTelegram(`Không ${parsed.kind === 'claim' ? 'nhận' : 'nhả'} được task #${parsed.id}: ${r.error}`);
+          }
+          continue;
+        }
         const r = applyTaskUpdate(parsed);
         if (r.ok) {
           const m = r.message;
           const confirm = `[telegram] Martin đã đổi #${m.id} sang ${m.task.status}${m.task.assignee ? ' · ' + m.task.assignee : ''} (nút Telegram): ${String(m.text).split('\n')[0].slice(0, 100)}`;
           const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
           console.log(`[telegram] callback #${msg.id} #${m.id} -> ${m.task.status}`);
-          try { await fetch(tgApi('answerCallbackQuery'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callback_query_id: cq.id, text: 'Đã cập nhật' }) }); } catch {}
+          await answerCallback('Đã cập nhật');
+        } else {
+          await answerCallback(r.error);
         }
         continue;
       }
@@ -1291,7 +1659,10 @@ function taskBadge(m) {
   if (!m.task) return '';
   const assignee = m.task.assignee ? ` · ${esc(m.task.assignee)}` : '';
   const deadline = m.task.deadline ? ` · hạn ${esc(m.task.deadline)}` : '';
-  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}]</span>`;
+  const lock = m.task.lockedBy
+    ? ` · 🔒 ${esc(m.task.lockedBy)}${lockStale(m.task) ? ' (khóa hết hạn)' : ''}`
+    : '';
+  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}${lock}]</span>`;
 }
 
 // @mention + read receipt (v1.5.0): chip @muse-b... và dòng "Đã đọc: ...".
@@ -1360,10 +1731,17 @@ function renderActions(m) {
     + `<option value="">Giao cho…</option>`
     + TASK_ASSIGNEES.map((a) => `<option value="${a}"${m.task.assignee === a ? ' selected' : ''}>${a}</option>`).join('')
     + `</select>` : '';
+  // Nhận việc / Nhả việc (v1.9.0): claim khóa task cho sender đang chọn
+  // trong form (todo → doing), release nhả khóa. Task bị người khác khóa
+  // thì server trả 409 kèm tên người giữ.
+  const claimBtns = m.task
+    ? ` <button type="button" data-action="claim" data-id="${m.id}" title="Nhận việc #${m.id} (khóa task cho bạn, todo → doing)">Nhận việc</button>`
+      + ` <button type="button" data-action="release" data-id="${m.id}" title="Nhả khóa task #${m.id}">Nhả việc</button>`
+    : '';
   return `<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">`
     + `<button type="button" data-action="reply" data-id="${m.id}" title="Trả lời tin #${m.id} (điền vào form bên dưới)">Trả lời</button>`
     + ` <button type="button" data-action="read" data-id="${m.id}" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>`
-    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect
+    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect + claimBtns
     + ` <button type="button" data-action="copy" data-id="${m.id}" title="Copy link tới tin #${m.id}">Copy link</button>`
     + `</div>`;
 }
@@ -1432,6 +1810,9 @@ function renderStatusPanel(s) {
   const deploy = s.deploy.enabled
     ? `${s.deploy.lastDeployAt ? `lần cuối ${esc(s.deploy.lastDeployAt)} (${esc(String(s.deploy.lastDeploySha || '').slice(0, 7))}) — ${esc(s.deploy.lastDeployResult || '')}` : 'chưa deploy lần nào'} (nhánh ${esc(s.deploy.branch)})`
     : 'TẮT (chưa đặt GITHUB_WEBHOOK_SECRET)';
+  const lifecycle = s.lifecycle
+    ? `${esc(String(s.lifecycle.lockedTasks))} task đang khóa · ${esc(String(s.lifecycle.staleLocks))} khóa hết hạn (timeout ${esc(String(s.lifecycle.lockTimeoutMinutes))} phút) · nhắc hạn ${s.lifecycle.reminderEnabled ? 'BẬT' : 'TẮT'}`
+    : '—';
   return `<div style="border:1px solid #ddd;border-radius:8px;padding:10px;margin:0 0 16px">
 <h2 style="margin:0 0 8px">Trạng thái hệ thống</h2>
 <table cellpadding="4" cellspacing="0">
@@ -1441,6 +1822,7 @@ function renderStatusPanel(s) {
 <tr><td>Main HEAD</td><td>${head}</td></tr>
 <tr><td>PR đang mở</td><td>${prs}</td></tr>
 <tr><td>Deploy cuối</td><td>${deploy}</td></tr>
+<tr><td>Task lifecycle</td><td>${lifecycle}</td></tr>
 </table>
 </div>`;
 }
@@ -1480,9 +1862,12 @@ function renderKanban(filters) {
     const cards = list.map((m) => {
       const overdue = deadlineBucket(m) === 'overdue' && (status === 'todo' || status === 'doing');
       const first = esc(String(m.text).split('\n')[0].slice(0, 120));
+      const lockLine = m.task.lockedBy
+        ? `<div style="color:#888;font-size:12px;margin-top:4px">🔒 ${esc(m.task.lockedBy)}${lockStale(m.task) ? ' (khóa hết hạn)' : ''}</div>`
+        : '';
       return `<div style="border:1px solid #ddd;border-radius:8px;padding:8px;margin:0 0 8px;background:#fff">
         <b><a href="/b/${esc(BRIDGE_TOKEN)}#msg-${m.id}">#${m.id}</a></b> ${esc(m.sender)}
-        <div style="margin-top:4px">${first}</div>
+        <div style="margin-top:4px">${first}</div>${lockLine}
         <div style="color:#888;font-size:12px;margin-top:4px">${m.task.assignee ? `Giao: ${esc(m.task.assignee)} · ` : ''}${m.task.deadline ? `<span${overdue ? ' style="color:#c00;font-weight:bold"' : ''}>Hạn: ${esc(m.task.deadline)}${overdue ? ' (quá hạn)' : ''}</span>` : 'Chưa có hạn'}</div>
       </div>`;
     }).join('') || '<p style="color:#888;font-size:12px"><i>Không có task nào.</i></p>';
@@ -1624,6 +2009,7 @@ ${main}
       <option value="">— không đặt —</option>
       <option value="todo">todo</option>
       <option value="doing">doing</option>
+      <option value="review">review</option>
       <option value="done">done</option>
       <option value="blocked">blocked</option>
     </select>
@@ -1650,7 +2036,7 @@ ${main}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -1690,13 +2076,15 @@ ${main}
       + '<button type="button" data-action="reply" data-id="' + m.id + '" title="Trả lời tin #' + m.id + '">Trả lời</button>'
       + ' <button type="button" data-action="read" data-id="' + m.id + '" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>';
     if (m.task) {
-      ['todo', 'doing', 'done', 'blocked'].forEach(function (st) {
+      ['todo', 'doing', 'review', 'done', 'blocked'].forEach(function (st) {
         h += ' <button type="button" data-action="status" data-id="' + m.id + '" data-status="' + st + '" title="Đổi task #' + m.id + ' sang ' + st + '">' + st + '</button>';
       });
       h += ' <select data-action="assign" data-id="' + m.id + '" title="Giao task #' + m.id + ' cho..."><option value="">Giao cho…</option>'
         + ['muse-a', 'muse-b', 'muse-c', 'martin'].map(function (a) {
             return '<option value="' + a + '"' + (m.task.assignee === a ? ' selected' : '') + '>' + a + '</option>';
           }).join('') + '</select>';
+      h += ' <button type="button" data-action="claim" data-id="' + m.id + '" title="Nhận việc #' + m.id + ' (khóa task cho bạn, todo → doing)">Nhận việc</button>'
+        + ' <button type="button" data-action="release" data-id="' + m.id + '" title="Nhả khóa task #' + m.id + '">Nhả việc</button>';
     }
     h += ' <button type="button" data-action="copy" data-id="' + m.id + '" title="Copy link tới tin #' + m.id + '">Copy link</button></div>';
     return h;
@@ -1706,7 +2094,8 @@ ${main}
     if (m.task) {
       badge = ' <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[' +
         escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') +
-        (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') + ']</span>';
+        (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') +
+        (m.task.lockedBy ? ' · 🔒 ' + escHtml(m.task.lockedBy) : '') + ']</span>';
     }
     if (m.mentions && m.mentions.length) {
       badge += ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">' +
@@ -1834,6 +2223,13 @@ ${main}
       } else if (action === 'status') {
         api('/api/messages/' + id + '/task', 'PATCH', { status: btn.getAttribute('data-status'), sender: currentSender() }).then(function (r) {
           if (!r.ok) { alert('Không đổi được trạng thái: ' + (r.json.error || r.status)); return; }
+          refreshRow(id); refreshWhatsNew();
+        });
+      } else if (action === 'claim' || action === 'release') {
+        var claimer = currentSender();
+        if (['muse-a', 'muse-b', 'muse-c', 'martin'].indexOf(claimer) === -1) { alert('Chọn sender trong form rồi bấm lại.'); return; }
+        api('/api/messages/' + id + '/' + action, 'POST', { sender: claimer }).then(function (r) {
+          if (!r.ok) { alert('Không ' + (action === 'claim' ? 'nhận' : 'nhả') + ' được task: ' + (r.json.error || r.status)); return; }
           refreshRow(id); refreshWhatsNew();
         });
       } else if (action === 'copy') {
@@ -2058,6 +2454,12 @@ const server = http.createServer(async (req, res) => {
       presence: presenceStatus(),
       unread: unreadCounts(),
       summary: buildRollingSummary(),
+      lifecycle: {
+        lockTimeoutMinutes: TASK_LOCK_TIMEOUT_MINUTES,
+        reminderEnabled: TASK_REMINDER_ENABLED,
+        lockedTasks: messages.filter((m) => m.task?.lockedBy && !lockStale(m.task)).length,
+        staleLocks: messages.filter((m) => m.task?.lockedBy && lockStale(m.task)).length,
+      },
     });
   }
 
@@ -2206,10 +2608,19 @@ ${wdRows}
     const status = url.searchParams.get('status') || '';
     const assignee = url.searchParams.get('assignee') || '';
     const deadline = url.searchParams.get('deadline') || '';
+    const locked = url.searchParams.get('locked') || '';
+    const matchLocked = (t) => {
+      if (!locked || locked === 'all') return true;
+      if (locked === 'held') return Boolean(t.lockedBy) && !lockStale(t);
+      if (locked === 'stale') return Boolean(t.lockedBy) && lockStale(t);
+      if (locked === 'free') return !t.lockedBy;
+      return true;
+    };
     const list = messages.filter((m) => m.task
       && (!status || m.task.status === status)
       && (!assignee || m.task.assignee === assignee)
-      && matchDeadlineFilter(m, deadline));
+      && matchDeadlineFilter(m, deadline)
+      && matchLocked(m.task));
     return json(res, 200, { ok: true, tasks: list });
   }
 
@@ -2338,7 +2749,8 @@ ${wdRows}
       : null;
     const open = openTasks().map((m) => ({
       id: m.id, sender: m.sender, status: m.task.status, assignee: m.task.assignee,
-      deadline: m.task.deadline || null, text: String(m.text).split('\n')[0].slice(0, 120),
+      deadline: m.task.deadline || null, lockedBy: m.task.lockedBy || null,
+      text: String(m.text).split('\n')[0].slice(0, 120),
     }));
     return json(res, 200, {
       ok: true, sender, since,
@@ -2431,6 +2843,9 @@ ${wdRows}
   }
 
   // PATCH /api/messages/:id/task — update a message's task assignment/status
+  // (v1.9.0: chuyển trạng thái phải theo TASK_TRANSITIONS; task đang bị
+  // người khác khóa thì trả 409 trừ khi caller là người giữ khóa, Martin,
+  // hoặc khóa đã hết hạn; done/todo tự nhả khóa).
   const taskPatch = p.match(/^\/api\/messages\/(\d+)\/task$/);
   if (taskPatch && req.method === 'PATCH') {
     if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
@@ -2443,6 +2858,18 @@ ${wdRows}
     if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
     const msg = messages.find((m) => m.id === Number(taskPatch[1]));
     if (!msg) return json(res, 404, { ok: false, error: 'message not found' });
+    const caller = data.sender || null;
+    if (data.status !== undefined) {
+      if (!TASK_STATUSES.includes(data.status)) {
+        return json(res, 400, { ok: false, error: 'status must be todo|doing|review|done|blocked' });
+      }
+      const t = checkTransition(msg.task || { status: 'todo' }, data.status);
+      if (!t.ok) return json(res, 400, { ok: false, error: t.error });
+    }
+    if (data.status !== undefined || data.assignee !== undefined || data.deadline !== undefined) {
+      const lockErr = lockBlocks(msg.task, caller);
+      if (lockErr) return json(res, 409, { ok: false, error: lockErr });
+    }
     const next = { ...(msg.task || { assignee: null, status: 'todo' }) };
     if (data.assignee !== undefined) {
       if (data.assignee !== null && !TASK_ASSIGNEES.includes(data.assignee)) {
@@ -2451,9 +2878,6 @@ ${wdRows}
       next.assignee = data.assignee;
     }
     if (data.status !== undefined) {
-      if (!TASK_STATUSES.includes(data.status)) {
-        return json(res, 400, { ok: false, error: 'status must be todo|doing|done|blocked' });
-      }
       next.status = data.status;
     }
     if (data.deadline !== undefined) {
@@ -2465,10 +2889,43 @@ ${wdRows}
         next.deadline = String(data.deadline);
       }
     }
+    if (next.status === 'done' || next.status === 'todo') {
+      delete next.lockedBy;
+      delete next.lockedAt;
+    }
     msg.task = next;
     persistMessages();
     appendAudit({ action: 'task.update', sender: data.sender || null, messageId: msg.id, source: 'api', ip: clientIp(req) });
     return json(res, 200, { ok: true, message: msg });
+  }
+
+  // Claim / release task (v1.9.0): POST /api/messages/:id/claim và
+  // POST /api/messages/:id/release {"token","sender"} — sender là
+  // muse-a|muse-b|muse-c|martin. Claim khóa task cho sender (todo →
+  // doing); task đang bị người khác khóa còn hiệu lực thì trả 409 kèm
+  // tên người giữ. Release chỉ người giữ khóa hoặc Martin mới nhả được.
+  const claimPatch = p.match(/^\/api\/messages\/(\d+)\/(claim|release)$/);
+  if (claimPatch && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    if (!TASK_ASSIGNEES.includes(data.sender)) {
+      return json(res, 400, { ok: false, error: 'sender must be muse-a|muse-b|muse-c|martin' });
+    }
+    const action = claimPatch[2];
+    const r = action === 'claim'
+      ? claimTask(Number(claimPatch[1]), data.sender, 'api')
+      : releaseTask(Number(claimPatch[1]), data.sender, 'api');
+    if (!r.ok) {
+      const code = r.code === 'not_found' ? 404 : r.code === 'locked' ? 409 : 400;
+      return json(res, code, { ok: false, error: r.error });
+    }
+    return json(res, 200, { ok: true, message: r.message, ...(r.tookOver ? { tookOver: true } : {}), ...(r.prevHolder ? { prevHolder: r.prevHolder } : {}) });
   }
 
   // Read receipt (v1.5.0): POST /api/messages/:id/read {"token","reader"}
@@ -2542,6 +2999,8 @@ server.listen(PORT, HOST, () => {
   console.log(`Board v1.7.0: Kanban + lọc task (?view=kanban), thẻ GitHub mở rộng, panel trạng thái (/api/board-status), ghim tin + bảng Quyết định (POST /api/messages/:id/pin)`);
   console.log(`Board v1.8.0: chế độ xem "Đã ghim & Quyết định" (?view=saved&q=&fsender=&fkind=) + GET /api/pinned + GET /api/decisions?q=&sender=`);
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
+  console.log(`Task lifecycle v1.9.0: claim → doing → review → done (POST /api/messages/:id/claim|release, khóa hết hạn sau ${TASK_LOCK_TIMEOUT_MINUTES} phút không hoạt động, nhắc task quá hạn / hạn hôm nay ${TASK_REMINDER_ENABLED ? 'BẬT' : 'TẮT'})`);
+  console.log(`Duyệt nhanh PR trên Telegram v1.9.0: BẬT — nút ✅ Duyệt / 🔀 Merge dưới tin PR, lệnh /approve / /merge${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — nút Merge chỉ ghi quyết định + trả link merge tay)'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
@@ -2549,4 +3008,12 @@ server.listen(PORT, HOST, () => {
   checkDigestDue();
   // Presence offline: kiểm tra mỗi phút (xem checkPresenceOffline).
   setInterval(checkPresenceOffline, 60_000);
+  // Task lifecycle (v1.9.0): quét khóa hết hạn + nhắc task quá hạn / hạn
+  // hôm nay mỗi phút; chạy 1 lần ngay khi khởi động để dọn khóa cũ.
+  setInterval(() => {
+    try { sweepTaskLocks(); } catch (e) { console.error('[lifecycle] sweep locks error:', e.message); }
+    try { sweepTaskReminders(); } catch (e) { console.error('[lifecycle] sweep reminders error:', e.message); }
+  }, 60_000);
+  sweepTaskLocks();
+  sweepTaskReminders();
 });
