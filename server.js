@@ -76,6 +76,27 @@
 //   1 dòng / tin chưa đọc, tối đa 20); GET /api/messages?since= giữ
 //   nguyên (chỉ lọc tin, không kèm summary).
 //
+// v1.7.0 (Muse B: ideas 1–3 cải thiện trang board, tin #107/#108 — Martin
+// chọn "làm cả 6 ideas", Muse A giao ideas 1–3 cho Muse B, 4–6 cho Muse C):
+//   1) Kanban + lọc task ngay trên board: ?view=kanban chuyển thread sang
+//      4 cột todo/doing/done/blocked, mỗi task là 1 thẻ có assignee,
+//      deadline, link về tin gốc; lọc theo assignee, status, deadline
+//      (quá hạn / hôm nay / trong tuần / chưa có hạn). Dùng lại task
+//      tracking v1.1.0 và type/reply_to v1.5.0; GET /api/tasks thêm lọc
+//      deadline=overdue|today|week|none.
+//   2) Thẻ GitHub mở rộng + panel trạng thái hệ thống: tin GitHub webhook
+//      lưu kèm dữ liệu event (push: danh sách commit + số file đổi;
+//      PR/issue/release: số, tiêu đề, trạng thái, link) và board hiện
+//      dạng <details> mở rộng được; panel đầu board hiện bridge status,
+//      main HEAD (git rev-parse, cache 60s), PR đang mở (GitHub API,
+//      cache 5 phút, lỗi thì báo không lấy được), deploy lần cuối.
+//      GET /api/board-status?token=... trả cùng dữ liệu dạng JSON.
+//   3) Ghim tin quan trọng + bảng Quyết định đã chốt: mỗi tin có nút
+//      Ghim/Bỏ ghim (POST /b/<token>/pin hoặc POST /api/messages/:id/pin,
+//      lưu cờ pinned vào tin); đầu board hiện mục Đã ghim, mục Việc đang
+//      giao (task todo/doing có assignee) và mục Quyết định đã chốt
+//      (tin type=decision, kèm ngày + link về tin gốc). Dùng lại dữ
+//      liệu tin + task tracking sẵn có, chỉ thêm giao diện ghim.
 // v1.7.0 (Muse C: 3 ideas improve trang board, tin #96/#101/#104/#107 —
 // Martin chọn "làm cả 6 ideas" ở #108, Muse A giao ideas 4-6 cho Muse C,
 // Martin xác nhận ở #111):
@@ -93,8 +114,7 @@
 //      (POST /api/typing + SSE event typing, hết hạn sau 5s không gõ),
 //      kèm avatar từng Muse với trạng thái online / lần cuối check-in.
 //      Tránh hai Muse cùng trả lời một việc và Martin biết ai đang làm
-//      gì ngay lúc đó.
-//
+//      gì ngay lúc đó.//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -408,7 +428,7 @@ function parseMentions(text) {
   return found;
 }
 
-function addMessage({ sender, text, source, task, type, reply_to }) {
+function addMessage({ sender, text, source, task, type, reply_to, github }) {
   const msg = {
     id: nextId++,
     ts: new Date().toISOString(),
@@ -417,6 +437,9 @@ function addMessage({ sender, text, source, task, type, reply_to }) {
     source: source || 'web',
     delivered: { telegram: null }, // null = not attempted (or Telegram off)
   };
+  // Dữ liệu event GitHub (v1.7.0): chỉ webhook tự gắn, xem
+  // buildGitHubMeta — tin cũ không có trường này vẫn đọc bình thường.
+  if (github && typeof github === 'object') msg.github = github;
   const t = normalizeTask(task);
   if (t) msg.task = t;
   const meta = normalizeMeta({ type, reply_to }, Boolean(t));
@@ -741,6 +764,68 @@ function readWatchdogHeartbeat() {
   return null;
 }
 
+// ---------- Board status panel (v1.7.0) ----------
+// Panel đầu board: bridge status + main HEAD + PR đang mở + deploy cuối.
+// HEAD lấy bằng git rev-parse trong REPO_DIR (máy Martin có checkout git;
+// máy khác không có thì trả null). PR đang mở lấy từ GitHub API public
+// (không cần token, giới hạn 60 request/giờ khi không auth) — cả 2 đều
+// cache ngắn hạn và lỗi thì trả null, không làm hỏng board.
+let headCache = { at: 0, sha: null };
+let prCache = { at: 0, prs: null };
+function getMainHead() {
+  const now = Date.now();
+  if (now - headCache.at < 60_000 && headCache.sha !== undefined) return Promise.resolve(headCache.sha);
+  return new Promise((resolve) => {
+    execFile('git', ['-C', REPO_DIR, 'rev-parse', 'HEAD'], { timeout: 5_000 }, (err, stdout) => {
+      const sha = err ? null : String(stdout || '').trim() || null;
+      headCache = { at: now, sha };
+      resolve(sha);
+    });
+  });
+}
+async function getOpenPRs() {
+  const now = Date.now();
+  if (now - prCache.at < 300_000 && prCache.prs !== undefined) return prCache.prs;
+  let prs = null;
+  try {
+    const res = await fetch('https://api.github.com/repos/tuanxminhxgi/muse2muse/pulls?state=open&per_page=20', {
+      signal: AbortSignal.timeout(3000),
+      headers: { accept: 'application/vnd.github+json', 'user-agent': 'muse-bridge' },
+    });
+    if (res.ok) {
+      const list = await res.json();
+      prs = (Array.isArray(list) ? list : []).map((pr) => ({ number: pr.number, title: pr.title, url: pr.html_url, author: pr.user?.login || '' }));
+    }
+  } catch { /* GitHub API lỗi / không mạng — panel báo không lấy được */ }
+  prCache = { at: now, prs };
+  return prs;
+}
+async function getBoardStatus() {
+  const head = await getMainHead();
+  const openPrs = await getOpenPRs();
+  return {
+    version: VERSION,
+    startedAt,
+    uptime_s: Math.round(process.uptime()),
+    messages: messages.length,
+    openTasks: openTasks().length,
+    telegram: telegramEnabled,
+    lastTelegramPollAt,
+    lastTelegramError,
+    watchdog: readWatchdogHeartbeat(),
+    head,
+    openPrs,
+    deploy: {
+      enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET),
+      branch: DEPLOY_BRANCH,
+      lastDeployAt: deployState.lastDeployAt,
+      lastDeploySha: deployState.lastDeploySha,
+      lastDeployResult: deployState.lastDeployResult,
+    },
+    presence: presenceStatus(),
+  };
+}
+
 // ---------- GitHub webhook → thread (v1.3.0) ----------
 // POST /api/github-webhook nhận event push / pull_request / issues / release
 // từ GitHub. Chỉ nhận khi GITHUB_WEBHOOK_SECRET đã đặt và chữ ký
@@ -785,6 +870,57 @@ function formatGitHubEvent(event, payload) {
   return null; // event khác (fork, star...) thì bỏ qua, không đăng tin
 }
 
+// Dữ liệu event GitHub để board mở rộng (v1.7.0): chỉ lấy những gì
+// payload webhook đã có sẵn, không gọi thêm API GitHub. Push: danh sách
+// commit (sha ngắn, message 1 dòng, tác giả, số file thêm/xóa/sửa);
+// PR/issue/release: số, tiêu đề/tag, trạng thái, link. Tin cũ (trước
+// v1.7.0) không có trường github thì board vẫn hiện như cũ.
+function buildGitHubMeta(event, payload) {
+  const repo = payload.repository?.full_name || 'unknown repo';
+  if (event === 'push') {
+    const branch = String(payload.ref || '').replace(/^refs\/heads\//, '');
+    return {
+      event, repo, branch,
+      compare: payload.compare || null,
+      commits: (payload.commits || []).slice(0, 20).map((c) => ({
+        sha: String(c.id || '').slice(0, 7),
+        message: String(c.message || '').split('\n')[0].slice(0, 120),
+        author: c.author?.name || c.author?.username || payload.sender?.login || '',
+        added: (c.added || []).length,
+        removed: (c.removed || []).length,
+        modified: (c.modified || []).length,
+      })),
+    };
+  }
+  if (event === 'pull_request') {
+    const pr = payload.pull_request || {};
+    return {
+      event, repo, number: pr.number, title: pr.title || '',
+      action: payload.action || '', merged: Boolean(pr.merged),
+      url: pr.html_url || null,
+      head: pr.head?.ref || null, base: pr.base?.ref || null,
+      author: payload.sender?.login || '',
+    };
+  }
+  if (event === 'issues') {
+    const issue = payload.issue || {};
+    return {
+      event, repo, number: issue.number, title: issue.title || '',
+      action: payload.action || '', url: issue.html_url || null,
+      author: payload.sender?.login || '',
+    };
+  }
+  if (event === 'release') {
+    const rel = payload.release || {};
+    return {
+      event, repo, tag: rel.tag_name || '', title: rel.name || '',
+      action: payload.action || '', url: rel.html_url || null,
+      author: payload.sender?.login || '',
+    };
+  }
+  return null;
+}
+
 async function handleGitHubWebhook(req, res) {
   if (!GITHUB_WEBHOOK_SECRET) return json(res, 503, { ok: false, error: 'github webhook not configured (set GITHUB_WEBHOOK_SECRET)' });
   const rawBody = await readBody(req);
@@ -810,7 +946,7 @@ async function handleGitHubWebhook(req, res) {
   }
   const text = formatGitHubEvent(event, payload);
   if (!text) return json(res, 200, { ok: true, ignored: `unsupported event: ${event}` });
-  const msg = addMessage({ sender: 'github', text, source: 'github-webhook' });
+  const msg = addMessage({ sender: 'github', text, source: 'github-webhook', github: buildGitHubMeta(event, payload) });
   console.log(`[github] #${msg.id} ${event} ${repo}`);
   forwardToTelegram(msg);
   // Auto-deploy (v1.4.0): cùng 1 webhook này vừa đăng tin vừa deploy khi
@@ -846,6 +982,37 @@ function localDayKey(d = new Date()) {
 
 function openTasks() {
   return messages.filter((m) => m.task && (m.task.status === 'todo' || m.task.status === 'doing'));
+}
+
+// Phân loại deadline (v1.7.0): so theo ngày địa phương (YYYY-MM-DD) của
+// máy chạy bridge. overdue = đã quá hạn mà task còn mở; today = hạn hôm
+// nay; week = hạn trong 7 ngày tới (kể cả hôm nay); none = không có hạn.
+function deadlineBucket(m) {
+  if (!m.task?.deadline) return 'none';
+  const day = String(m.task.deadline).slice(0, 10);
+  const today = localDayKey();
+  if (day < today) return 'overdue';
+  if (day === today) return 'today';
+  const diffDays = Math.round((new Date(`${day}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86_400_000);
+  return diffDays <= 7 ? 'week' : 'later';
+}
+function matchDeadlineFilter(m, filter) {
+  if (!filter || filter === 'all') return true;
+  if (filter === 'overdue') return deadlineBucket(m) === 'overdue' && (m.task.status === 'todo' || m.task.status === 'doing');
+  return deadlineBucket(m) === filter;
+}
+
+// Ghim tin (v1.7.0): cờ pinned lưu ngay trên tin, persistMessages ghi
+// lại messages.jsonl. Ghim/bỏ ghim không đăng tin mới lên thread.
+function setPinned(id, pinned) {
+  const msg = messages.find((m) => m.id === id);
+  if (!msg) return null;
+  if (pinned) msg.pinned = true;
+  else delete msg.pinned;
+  persistMessages();
+  appendAudit({ action: 'message.pin', sender: null, messageId: msg.id, source: 'api' });
+  broadcastMessage(msg);
+  return msg;
 }
 
 function buildDigestText() {
@@ -1191,19 +1358,156 @@ function renderActions(m) {
 function renderRow(m) {
   const reply = m.reply_to ? `<div style="color:#888;font-size:12px">Trả lời #${m.reply_to}</div>` : '';
   const type = m.type ? `<span style="color:#888;font-size:12px">[${esc(m.type)}]</span> ` : '';
+  const pinBtn = `<form method="POST" action="/b/${esc(BRIDGE_TOKEN)}/pin" style="display:inline;margin:0">
+    <input type="hidden" name="id" value="${m.id}">
+    <input type="hidden" name="pinned" value="${m.pinned ? '0' : '1'}">
+    <button type="submit" style="font-size:12px">${m.pinned ? 'Bỏ ghim' : 'Ghim'}</button>
+  </form>`;
+  const pinMark = m.pinned ? ` <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">📌 đã ghim</span>` : '';
+  const body = `<div style="white-space:pre-wrap;margin-top:4px">${type}${esc(m.text)}</div>${githubDetails(m)}`;
   return `
     <div id="msg-${m.id}" style="margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px">
-      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${mentionBadge(m)}
-      <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span>
+      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${mentionBadge(m)}${pinMark}
+      <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span> ${pinBtn}
       ${reply}
-      <div style="white-space:pre-wrap;margin-top:4px">${type}${esc(m.text)}</div>
+      ${body}
       ${readBadge(m)}
       ${renderActions(m)}
     </div>`;
 }
 
-function renderPage() {
+// Thẻ GitHub mở rộng (v1.7.0): tin webhook có dữ liệu event (msg.github)
+// thì hiện <details> với tóm tắt diff — push: từng commit + số file đổi;
+// PR/issue/release: số, tiêu đề, trạng thái, link. Tin GitHub cũ (không
+// có msg.github) chỉ hiện text như trước.
+function githubDetails(m) {
+  const g = m.github;
+  if (!g || typeof g !== 'object') return '';
+  if (g.event === 'push') {
+    const commits = (g.commits || []).map((c) => {
+      const files = [c.added ? `+${c.added} thêm` : '', c.modified ? `${c.modified} sửa` : '', c.removed ? `-${c.removed} xóa` : ''].filter(Boolean).join(', ');
+      return `<li><code>${esc(c.sha || '')}</code> ${esc(c.message || '')}${c.author ? ` — ${esc(c.author)}` : ''}${files ? ` (${files})` : ''}</li>`;
+    }).join('');
+    return `<details style="margin-top:6px"><summary style="cursor:pointer">Chi tiết push — ${g.commits?.length || 0} commit${g.branch ? ` @ ${esc(g.branch)}` : ''}${g.compare ? ` · <a href="${esc(g.compare)}">compare</a>` : ''}</summary><ul>${commits || '<li><i>Không có commit nào trong payload.</i></li>'}</ul></details>`;
+  }
+  if (g.event === 'pull_request' || g.event === 'issues') {
+    const kind = g.event === 'pull_request' ? 'PR' : 'Issue';
+    return `<details style="margin-top:6px"><summary style="cursor:pointer">${kind} #${esc(g.number ?? '')} — ${esc(g.title || '')}</summary><div>Trạng thái: ${esc(g.action || '')}${g.merged ? ' (đã merge)' : ''}${g.head && g.base ? ` · ${esc(g.head)} → ${esc(g.base)}` : ''}${g.author ? ` · bởi ${esc(g.author)}` : ''}${g.url ? ` · <a href="${esc(g.url)}">${esc(g.url)}</a>` : ''}</div></details>`;
+  }
+  if (g.event === 'release') {
+    return `<details style="margin-top:6px"><summary style="cursor:pointer">Release ${esc(g.tag || '')} — ${esc(g.title || '')}</summary><div>Trạng thái: ${esc(g.action || '')}${g.author ? ` · bởi ${esc(g.author)}` : ''}${g.url ? ` · <a href="${esc(g.url)}">${esc(g.url)}</a>` : ''}</div></details>`;
+  }
+  return '';
+}
+
+// Panel trạng thái hệ thống trên board (v1.7.0): bridge status + main
+// HEAD + PR đang mở + deploy lần cuối. openPrs === null nghĩa là GitHub
+// API không lấy được (không mạng / hết quota) — báo rõ, không giấu.
+function renderStatusPanel(s) {
+  const wd = s.watchdog;
+  const wdText = wd
+    ? `kiểm tra cuối ${esc(wd.checkedAt || '—')} · bridge ${wd.bridgeOk ? 'đang chạy' : 'CHẾT'} · cloudflared ${wd.cloudflaredOk ? 'đang chạy' : 'CHẾT'} · đã restart ${esc(String(wd.restarts ?? 0))} lần`
+    : 'chưa chạy lần nào';
+  const head = s.head
+    ? `<a href="https://github.com/tuanxminhxgi/muse2muse/commit/${esc(s.head)}"><code>${esc(s.head.slice(0, 7))}</code></a>`
+    : 'không lấy được';
+  const prs = s.openPrs === null
+    ? 'không lấy được (GitHub API lỗi / không mạng)'
+    : s.openPrs.length === 0
+      ? 'không có PR nào đang mở'
+      : `<ul style="margin:4px 0">${s.openPrs.map((pr) => `<li><a href="${esc(pr.url)}">PR #${pr.number}</a> ${esc(pr.title)}${pr.author ? ` — ${esc(pr.author)}` : ''}</li>`).join('')}</ul>`;
+  const deploy = s.deploy.enabled
+    ? `${s.deploy.lastDeployAt ? `lần cuối ${esc(s.deploy.lastDeployAt)} (${esc(String(s.deploy.lastDeploySha || '').slice(0, 7))}) — ${esc(s.deploy.lastDeployResult || '')}` : 'chưa deploy lần nào'} (nhánh ${esc(s.deploy.branch)})`
+    : 'TẮT (chưa đặt GITHUB_WEBHOOK_SECRET)';
+  return `<div style="border:1px solid #ddd;border-radius:8px;padding:10px;margin:0 0 16px">
+<h2 style="margin:0 0 8px">Trạng thái hệ thống</h2>
+<table cellpadding="4" cellspacing="0">
+<tr><td>Bridge</td><td>v${esc(s.version)} · chạy từ ${esc(s.startedAt)} (uptime ${esc(String(s.uptime_s))}s) · ${s.messages} tin · ${s.openTasks} task đang mở</td></tr>
+<tr><td>Telegram</td><td>${s.telegram ? 'BẬT' : 'TẮT'}${s.lastTelegramError ? ` · lỗi cuối: ${esc(s.lastTelegramError)}` : ''}</td></tr>
+<tr><td>Watchdog</td><td>${wdText}</td></tr>
+<tr><td>Main HEAD</td><td>${head}</td></tr>
+<tr><td>PR đang mở</td><td>${prs}</td></tr>
+<tr><td>Deploy cuối</td><td>${deploy}</td></tr>
+</table>
+</div>`;
+}
+
+// Mục ghim + quyết định ở đầu board (v1.7.0): tin được ghim tay (cờ
+// pinned), việc đang giao (task todo/doing có assignee), và quyết định
+// đã chốt (tin type=decision, mới nhất trước, kèm ngày + link về tin gốc).
+function renderTopSections() {
+  const pinned = messages.filter((m) => m.pinned);
+  const assigned = openTasks().filter((m) => m.task.assignee).slice(-10);
+  const decisions = messages.filter((m) => m.type === 'decision').slice(-10).reverse();
+  const link = (m, label) => `<li><a href="#msg-${m.id}">#${m.id}</a> ${label} <span style="color:#888;font-size:12px">${esc(m.ts.slice(0, 10))} · ${esc(m.sender)}</span></li>`;
+  let html = '';
+  if (pinned.length > 0) {
+    html += `<h2>📌 Đã ghim</h2><ul>${pinned.map((m) => link(m, esc(String(m.text).split('\n')[0].slice(0, 120)))).join('')}</ul>`;
+  }
+  if (assigned.length > 0) {
+    html += `<h2>Việc đang giao (${assigned.length})</h2><ul>${assigned.map((m) => link(m, `[${esc(m.task.status)} · ${esc(m.task.assignee)}${m.task.deadline ? ` · hạn ${esc(m.task.deadline)}` : ''}] ${esc(String(m.text).split('\n')[0].slice(0, 100))}`)).join('')}</ul>`;
+  }
+  if (decisions.length > 0) {
+    html += `<h2>Quyết định đã chốt (${decisions.length})</h2><ul>${decisions.map((m) => link(m, esc(String(m.text).split('\n')[0].slice(0, 140)))).join('')}</ul>`;
+  }
+  return html;
+}
+
+// Kanban (v1.7.0): 4 cột theo trạng thái task, mỗi task là 1 thẻ có
+// assignee, deadline (quá hạn tô đỏ), link về tin gốc. Lọc theo assignee
+// / status / deadline qua query (?view=kanban&fassignee=&fstatus=
+// &fdeadline=). Chỉ task mới vào Kanban; tin thường vẫn ở Thread.
+function renderKanban(filters) {
+  const tasks = messages.filter((m) => m.task
+    && (!filters.assignee || m.task.assignee === filters.assignee)
+    && (!filters.status || m.task.status === filters.status)
+    && matchDeadlineFilter(m, filters.deadline));
+  const cols = TASK_STATUSES.map((status) => {
+    const list = tasks.filter((m) => m.task.status === status);
+    const cards = list.map((m) => {
+      const overdue = deadlineBucket(m) === 'overdue' && (status === 'todo' || status === 'doing');
+      const first = esc(String(m.text).split('\n')[0].slice(0, 120));
+      return `<div style="border:1px solid #ddd;border-radius:8px;padding:8px;margin:0 0 8px;background:#fff">
+        <b><a href="/b/${esc(BRIDGE_TOKEN)}#msg-${m.id}">#${m.id}</a></b> ${esc(m.sender)}
+        <div style="margin-top:4px">${first}</div>
+        <div style="color:#888;font-size:12px;margin-top:4px">${m.task.assignee ? `Giao: ${esc(m.task.assignee)} · ` : ''}${m.task.deadline ? `<span${overdue ? ' style="color:#c00;font-weight:bold"' : ''}>Hạn: ${esc(m.task.deadline)}${overdue ? ' (quá hạn)' : ''}</span>` : 'Chưa có hạn'}</div>
+      </div>`;
+    }).join('') || '<p style="color:#888;font-size:12px"><i>Không có task nào.</i></p>';
+    return `<div style="flex:1;min-width:160px;border:1px solid #ddd;border-radius:8px;padding:8px;background:#f9f9f9">
+      <h3 style="margin:0 0 8px">${esc(status)} (${list.length})</h3>${cards}</div>`;
+  }).join('');
+  return `<div style="display:flex;gap:8px;align-items:flex-start">${cols}</div>`;
+}
+
+function filterForm(f) {
+  const opt = (value, current, label) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
+  const assignees = ['muse-a', 'muse-b', 'muse-c', 'martin'];
+  return `<form method="GET" action="/b/${esc(BRIDGE_TOKEN)}" style="margin:0 0 16px">
+  <input type="hidden" name="view" value="kanban">
+  <label>Giao cho: <select name="fassignee">${opt('', f.assignee, '— tất cả —')}${assignees.map((a) => opt(a, f.assignee, a)).join('')}</select></label>
+  <label> Trạng thái: <select name="fstatus">${opt('', f.status, '— tất cả —')}${TASK_STATUSES.map((s) => opt(s, f.status, s)).join('')}</select></label>
+  <label> Hạn: <select name="fdeadline">${opt('all', f.deadline, '— tất cả —')}${opt('overdue', f.deadline, 'Quá hạn')}${opt('today', f.deadline, 'Hôm nay')}${opt('week', f.deadline, 'Trong 7 ngày')}${opt('none', f.deadline, 'Chưa có hạn')}</select></label>
+  <button type="submit">Lọc</button>
+  <a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Xóa lọc</a>
+</form>`;
+}
+
+async function renderPage(query) {
+  const view = query.get('view') === 'kanban' ? 'kanban' : 'thread';
+  const filters = {
+    assignee: query.get('fassignee') || '',
+    status: query.get('fstatus') || '',
+    deadline: query.get('fdeadline') || 'all',
+  };
+  const status = await getBoardStatus();
   const rows = messages.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B và Muse C.</i></p>';
+  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`}</p>`;
+  const main = view === 'kanban'
+    ? `${filterForm(filters)}${renderKanban(filters)}`
+    : `<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
+<div id="thread">
+${rows}
+</div>`;
 
   return `<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1220,17 +1524,17 @@ html{scroll-behavior:smooth}
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:24px auto;padding:0 16px">
 <h1>Muse Bridge</h1>
 <p>Mailbox chung cho <b>muse-a</b>, <b>muse-b</b> và <b>muse-c</b>. Tin nhắn ở đây cũng được chuyển sang Telegram và ngược lại. Trang tự cập nhật live (SSE), không cần refresh.</p>
+${renderStatusPanel(status)}
 <p>Presence: ${presenceStatus().map((p) => `${p.muse} ${p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : 'online ' + p.agoMinutes + ' phút trước')}`).join(' · ')}</p>
 <p>Tóm tắt: ${esc(buildRollingSummary().text)}</p>
 ${renderWhatsNew()}
 <p>Đang ở đây: <span id="presence-avatars">${renderPresenceAvatars()}</span></p>
 <p id="typing-line" style="color:#888;font-size:13px;min-height:18px;margin:4px 0"></p>
 <p>Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT'}</p>
+${renderTopSections()}
 <p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
-<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
-<div id="thread">
-${rows}
-</div>
+${viewToggle}
+${main}
 <h2>Gửi tin</h2>
 <form id="compose-form" method="POST" action="/b/${esc(BRIDGE_TOKEN)}/msg">
   <label>Sender:
@@ -1281,7 +1585,7 @@ ${rows}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/typing?token=...</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -1347,10 +1651,30 @@ ${rows}
     var type = m.type ? '<span style="color:#888;font-size:12px">[' + escHtml(m.type) + ']</span> ' : '';
     var read = (m.read_by && m.read_by.length)
       ? '<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ' + m.read_by.map(escHtml).join(', ') + '</div>' : '';
-    return '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge +
-      ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span>' +
+    var pinMark = m.pinned ? ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">📌 đã ghim</span>' : '';
+    var pinBtn = '<form method="POST" action="/b/' + TOKEN + '/pin" style="display:inline;margin:0">'
+      + '<input type="hidden" name="id" value="' + m.id + '">'
+      + '<input type="hidden" name="pinned" value="' + (m.pinned ? '0' : '1') + '">'
+      + '<button type="submit" style="font-size:12px">' + (m.pinned ? 'Bỏ ghim' : 'Ghim') + '</button></form>';
+    var gh = '';
+    if (m.github) {
+      if (m.github.event === 'push') {
+        var items = (m.github.commits || []).map(function (c) {
+          var files = [c.added ? '+' + c.added + ' thêm' : '', c.modified ? c.modified + ' sửa' : '', c.removed ? '-' + c.removed + ' xóa' : ''].filter(Boolean).join(', ');
+          return '<li><code>' + escHtml(c.sha || '') + '</code> ' + escHtml(c.message || '') + (c.author ? ' — ' + escHtml(c.author) : '') + (files ? ' (' + files + ')' : '') + '</li>';
+        }).join('');
+        gh = '<details style="margin-top:6px"><summary style="cursor:pointer">Chi tiết push — ' + (m.github.commits || []).length + ' commit' + (m.github.branch ? ' @ ' + escHtml(m.github.branch) : '') + '</summary><ul>' + (items || '<li><i>Không có commit nào trong payload.</i></li>') + '</ul></details>';
+      } else if (m.github.event === 'pull_request' || m.github.event === 'issues') {
+        var kind = m.github.event === 'pull_request' ? 'PR' : 'Issue';
+        gh = '<details style="margin-top:6px"><summary style="cursor:pointer">' + kind + ' #' + escHtml(m.github.number == null ? '' : m.github.number) + ' — ' + escHtml(m.github.title || '') + '</summary><div>Trạng thái: ' + escHtml(m.github.action || '') + (m.github.merged ? ' (đã merge)' : '') + (m.github.url ? ' · <a href="' + escHtml(m.github.url) + '">' + escHtml(m.github.url) + '</a>' : '') + '</div></details>';
+      } else if (m.github.event === 'release') {
+        gh = '<details style="margin-top:6px"><summary style="cursor:pointer">Release ' + escHtml(m.github.tag || '') + ' — ' + escHtml(m.github.title || '') + '</summary><div>Trạng thái: ' + escHtml(m.github.action || '') + (m.github.url ? ' · <a href="' + escHtml(m.github.url) + '">' + escHtml(m.github.url) + '</a>' : '') + '</div></details>';
+      }
+    }
+    return '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge + pinMark +
+      ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span> ' + pinBtn +
       reply +
-      '<div style="white-space:pre-wrap;margin-top:4px">' + type + escHtml(m.text) + '</div>' +
+      '<div style="white-space:pre-wrap;margin-top:4px">' + type + escHtml(m.text) + '</div>' + gh +
       read + actionsHtml(m);
   }
   function refreshRow(id) {
@@ -1371,8 +1695,7 @@ ${rows}
       var latestEl = document.getElementById('wn-latest');
       if (latestEl && s.latestId) {
         var last = (j.delta || []).filter(function (x) { return x.id === s.latestId; })[0];
-        if (last) latestEl.innerHTML = 'Tin mới nhất: <a href="#msg-' + last.id + '">#' + last.id + ' ' + escHtml(last.sender) + ': ' + escHtml(String(last.text).split('\n')[0].slice(0, 120)) + '</a>';
-      }
+        if (last) latestEl.innerHTML = 'Tin mới nhất: <a href="#msg-' + last.id + '">#' + last.id + ' ' + escHtml(last.sender) + ': ' + escHtml(String(last.text).split('\n')[0].slice(0, 120)) + '</a>';      }
       var tasksEl = document.getElementById('wn-tasks');
       if (tasksEl && j.openTasks) {
         tasksEl.innerHTML = 'Task đang mở (' + j.openTasks.length + '): ' + (j.openTasks.length === 0 ? 'Không có task đang mở.' :
@@ -1396,6 +1719,7 @@ ${rows}
           var m = JSON.parse(ev.data);
           if (!m || typeof m.id !== 'number' || m.id <= maxId) return;
           if (document.getElementById('msg-' + m.id)) return;
+          if (!document.getElementById('thread')) return; // đang ở Kanban: không append vào thread
           maxId = m.id;
           var div = document.createElement('div');
           div.id = 'msg-' + m.id;
@@ -1544,8 +1868,7 @@ ${rows}
     var typing = ev.target && (ev.target.tagName === 'TEXTAREA' || ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT');
     if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'k' || ev.key === 'K')) { ev.preventDefault(); openPalette(); return; }
     if (ev.key === 'Escape') { closePalette(); return; }
-    if (ev.key === '/' && !typing) { ev.preventDefault(); var t = document.getElementById('compose-text'); if (t) t.focus(); }
-  });
+    if (ev.key === '/' && !typing) { ev.preventDefault(); var t = document.getElementById('compose-text'); if (t) t.focus(); }  });
   // ----- Chỉ báo đang gõ (v1.7.0): ping tối đa 1 lần / 2s trong lúc gõ -----
   var composeText = document.getElementById('compose-text');
   var lastTypingPing = 0;
@@ -1737,7 +2060,23 @@ ${wdRows}
   if (p === `/b/${BRIDGE_TOKEN}` && req.method === 'GET') {
     if (tokenExpired()) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }); return res.end(TOKEN_EXPIRED_MSG); }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    return res.end(renderPage());
+    return res.end(await renderPage(url.searchParams));
+  }
+
+  // Ghim / bỏ ghim 1 tin từ form trên board (v1.7.0): POST
+  // /b/<token>/pin với id + pinned=1|0, xong redirect về lại board.
+  if (p === `/b/${BRIDGE_TOKEN}/pin` && req.method === 'POST') {
+    if (tokenExpired()) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }); return res.end(TOKEN_EXPIRED_MSG); }
+    if (rateLimited(req)) { res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('rate limited'); }
+    const body = new URLSearchParams(await readBody(req));
+    const id = Number(body.get('id'));
+    if (!Number.isInteger(id) || id <= 0) { res.writeHead(400); return res.end('id không hợp lệ'); }
+    const pinned = body.get('pinned') === '1' || body.get('pinned') === 'true';
+    const msg = setPinned(id, pinned);
+    if (!msg) { res.writeHead(404); return res.end('message not found'); }
+    console.log(`[mailbox] ${pinned ? 'pinned' : 'unpinned'} #${msg.id}`);
+    res.writeHead(302, { location: `/b/${BRIDGE_TOKEN}` });
+    return res.end();
   }
 
   // Form post from the mailbox page
@@ -1801,10 +2140,20 @@ ${wdRows}
     if (!requireToken()) return;
     const status = url.searchParams.get('status') || '';
     const assignee = url.searchParams.get('assignee') || '';
+    const deadline = url.searchParams.get('deadline') || '';
     const list = messages.filter((m) => m.task
       && (!status || m.task.status === status)
-      && (!assignee || m.task.assignee === assignee));
+      && (!assignee || m.task.assignee === assignee)
+      && matchDeadlineFilter(m, deadline));
     return json(res, 200, { ok: true, tasks: list });
+  }
+
+  // Board status panel (v1.7.0): GET /api/board-status?token=... — cùng
+  // dữ liệu panel đầu board dạng JSON (bridge, watchdog, main HEAD,
+  // PR đang mở, deploy cuối).
+  if (p === '/api/board-status' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, status: await getBoardStatus() });
   }
 
   if (p === '/api/export' && req.method === 'GET') {
@@ -2061,6 +2410,27 @@ ${wdRows}
     return json(res, 200, { ok: true, message: msg });
   }
 
+  // Ghim / bỏ ghim (v1.7.0): POST /api/messages/:id/pin
+  // {"token","pinned":true|false} — lưu cờ pinned vào tin, board hiện
+  // mục Đã ghim ở đầu trang. Tin không tồn tại trả 404.
+  const pinPatch = p.match(/^\/api\/messages\/(\d+)\/pin$/);
+  if (pinPatch && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    if (typeof data.pinned !== 'boolean') {
+      return json(res, 400, { ok: false, error: 'pinned must be true|false' });
+    }
+    const msg = setPinned(Number(pinPatch[1]), data.pinned);
+    if (!msg) return json(res, 404, { ok: false, error: 'message not found' });
+    return json(res, 200, { ok: true, message: msg });
+  }
+
   // Wrong / missing token on the mailbox path — don't leak whether it exists.
   if (p.startsWith('/b/')) { res.writeHead(404); return res.end('Not found'); }
   res.writeHead(404); return res.end('Not found');
@@ -2079,6 +2449,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Presence: offline sau ${PRESENCE_OFFLINE_MINUTES} phút, digest khi quay lại sau ${PRESENCE_DIGEST_MINUTES} phút`);
   console.log(`Mentions + read receipts: BẬT — @muse-a|muse-b|muse-c, POST /api/messages/:id/read, GET /api/messages?for= / ?unread_by=`);
   console.log(`Rolling summary + since-delta: BẬT — GET /api/since?sender=&since= (tóm tắt lăn + tin mới + task đang mở)`);
+  console.log(`Board v1.7.0: Kanban + lọc task (?view=kanban), thẻ GitHub mở rộng, panel trạng thái (/api/board-status), ghim tin + bảng Quyết định (POST /api/messages/:id/pin)`);
   console.log(`Board v1.7.0: panel "Có gì mới" + thao tác nhanh + command palette (Ctrl+K) + typing indicator (POST /api/typing, SSE event typing)`);
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);

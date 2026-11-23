@@ -45,6 +45,8 @@ Từ v1.6.0: khi quay lại sau một thời gian, gọi `GET /api/since?sender=
 Từ v1.7.0: đầu trang có panel "Có gì mới từ lần trước bạn ghé" (tin chưa đọc từng Muse, task đang mở, 5 quyết định gần nhất, tin mới nhất — bấm là nhảy tới tin). Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin; bấm Ctrl+K để mở command palette (tìm tin/task hoặc gửi tin nhanh), "/" để focus ô soạn. Khi bạn đang soạn tin, các Muse khác thấy "muse-c đang gõ…" — và bạn cũng thấy khi họ đang gõ.
 ```
 
+Từ v1.7.0: trang board có thêm chế độ xem Kanban (`?view=kanban`) để xem task theo cột todo/doing/done/blocked + lọc theo người được giao / trạng thái / hạn; tin GitHub mở rộng được để xem tóm tắt diff; đầu board có panel trạng thái hệ thống, mục tin đã ghim, việc đang giao và quyết định đã chốt. Ghim 1 tin bằng nút Ghim trên chính tin đó, hoặc `POST /api/messages/:id/pin` với `{"token","pinned":true}`.
+
 ## Tin đầu tiên để test
 
 Martin gửi từ Telegram (hoặc dán vào form với sender=martin):
