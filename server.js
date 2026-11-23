@@ -17,6 +17,17 @@
 // message Martin sends in that Telegram chat is ingested into the mailbox.
 // No dependencies — Node 18+ only (uses global fetch, http, fs).
 //
+// v1.3.0 (Muse B's 3 ideas, tin #42/#43):
+//   1) GitHub webhook → thread: POST /api/github-webhook (HMAC SHA-256)
+//      đăng tin push/PR/issue/release vào mailbox, Martin thấy ngay trên
+//      Telegram mà không cần ai tự check GitHub.
+//   2) Watchdog tự phục hồi trên PC: deploy/watchdog.sh + systemd
+//      timer giám sát bridge + cloudflared, tự restart khi chết, báo
+//      Telegram khi không lên được; GET /status cho Martin xem.
+//   3) Nhắc việc + digest định kỳ: mỗi sáng DIGEST_TIME tự đăng digest
+//      các task đang mở (todo/doing) + nhắc task quá hạn chưa cập nhật;
+//      POST /api/digest để kích hoạt ngay, GET /api/digest để xem trước.
+//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -29,7 +40,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -54,10 +65,29 @@ const DATA_FILE = (() => {
 const TOKEN_FILE = path.join(__dirname, 'token.txt');
 const AUDIT_FILE = path.join(__dirname, 'audit.jsonl');
 const OUTBOX_FILE = path.join(__dirname, 'outbox.jsonl');
+const DIGEST_STATE_FILE = path.join(__dirname, 'digest-state.json');
+const WATCHDOG_FILE = (() => {
+  const raw = process.env.WATCHDOG_FILE || 'watchdog.json';
+  return path.isAbsolute(raw) ? raw : path.join(__dirname, raw);
+})();
+// GitHub webhook (v1.3.0): secret để verify chữ ký HMAC; để trống = webhook
+// tắt hẳn (fail closed — không nhận event không ký). Repos được phép, cách
+// nhau bằng dấu phẩy, dạng owner/repo.
+const GITHUB_WEBHOOK_SECRET = (process.env.GITHUB_WEBHOOK_SECRET || '').trim();
+const GITHUB_WEBHOOK_REPOS = (process.env.GITHUB_WEBHOOK_REPOS
+  || 'tuanxminhxgi/muse2muse,tuanxminhxgi/agent-tools')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+// Digest + nhắc việc (v1.3.0): giờ địa phương trên máy chạy bridge (PC Martin
+// đang ở giờ VN). DIGEST_ENABLED=false để tắt hẳn.
+const DIGEST_ENABLED = (process.env.DIGEST_ENABLED || 'true').toLowerCase() !== 'false';
+const DIGEST_TIME = (process.env.DIGEST_TIME || '08:00').trim();
+const DIGEST_REMINDER_HOURS = Number(process.env.DIGEST_REMINDER_HOURS || 24);
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 const TELEGRAM_POLL_MS = Number(process.env.TELEGRAM_POLL_MS || 2000);
-const SENDERS = ['muse-a', 'muse-b', 'muse-c', 'martin', 'user', 'telegram'];
+const SENDERS = ['muse-a', 'muse-b', 'muse-c', 'martin', 'user', 'telegram', 'github', 'bridge'];
+// 'github' = tin tự động từ GitHub webhook; 'bridge' = digest/nhắc việc tự động.
+// Hai sender này chỉ server tự dùng, không có trong form gửi tay trên board.
 const TASK_ASSIGNEES = ['muse-a', 'muse-b', 'muse-c', 'martin'];
 const TASK_STATUSES = ['todo', 'doing', 'done', 'blocked'];
 const startedAt = new Date().toISOString();
@@ -278,6 +308,169 @@ async function retryOutbox() {
 }
 setInterval(retryOutbox, 30_000);
 
+// ---------- Watchdog heartbeat (v1.3.0) ----------
+// deploy/watchdog.sh (chạy bằng systemd timer trên PC Martin) ghi heartbeat
+// vào WATCHDOG_FILE sau mỗi lần kiểm tra bridge + cloudflared. /status đọc
+// file này để Martin biết lần kiểm tra cuối là khi nào và có phải restart
+// gì không. File vắng mặt = watchdog chưa từng chạy.
+function readWatchdogHeartbeat() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(WATCHDOG_FILE, 'utf8'));
+    if (raw && typeof raw === 'object') return raw;
+  } catch { /* no heartbeat yet, or unreadable — report as null */ }
+  return null;
+}
+
+// ---------- GitHub webhook → thread (v1.3.0) ----------
+// POST /api/github-webhook nhận event push / pull_request / issues / release
+// từ GitHub. Chỉ nhận khi GITHUB_WEBHOOK_SECRET đã đặt và chữ ký
+// x-hub-signature-256 khớp (HMAC SHA-256 trên raw body). Repo ngoài
+// GITHUB_WEBHOOK_REPOS thì bỏ qua. Event ping chỉ trả 200, không đăng tin.
+// GitHub gửi lại (retry) cùng 1 delivery id khi bridge lỗi — nhớ 200 id gần
+// nhất để không đăng trùng.
+const seenDeliveries = new Set();
+function verifyGitHubSignature(rawBody, signature) {
+  if (!GITHUB_WEBHOOK_SECRET || !signature) return false;
+  const expected = 'sha256=' + crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET)
+    .update(rawBody, 'utf8').digest('hex');
+  const a = Buffer.from(signature, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function formatGitHubEvent(event, payload) {
+  const repo = payload.repository?.full_name || 'unknown repo';
+  const sender = payload.sender?.login || 'unknown';
+  if (event === 'push') {
+    const branch = String(payload.ref || '').replace(/^refs\/heads\//, '');
+    const commits = payload.commits || [];
+    const first = commits[0]?.message?.split('\n')[0] || '';
+    const extra = commits.length > 1 ? ` (+${commits.length - 1} commit nữa)` : '';
+    return `[github] push ${repo}@${branch} — ${commits.length} commit bởi ${sender}: "${first}"${extra}${payload.compare ? `\n${payload.compare}` : ''}`;
+  }
+  if (event === 'pull_request') {
+    const pr = payload.pull_request || {};
+    const action = payload.action || '';
+    const merged = action === 'closed' && pr.merged ? ' (đã merge)' : '';
+    return `[github] PR #${pr.number} ${repo} — ${action}${merged}: "${pr.title}" bởi ${sender}\n${pr.html_url || ''}`;
+  }
+  if (event === 'issues') {
+    const issue = payload.issue || {};
+    return `[github] Issue #${issue.number} ${repo} — ${payload.action}: "${issue.title}" bởi ${sender}\n${issue.html_url || ''}`;
+  }
+  if (event === 'release') {
+    const rel = payload.release || {};
+    return `[github] Release ${repo} — ${payload.action}: ${rel.tag_name || ''} "${rel.name || ''}" bởi ${sender}\n${rel.html_url || ''}`;
+  }
+  return null; // event khác (fork, star...) thì bỏ qua, không đăng tin
+}
+
+async function handleGitHubWebhook(req, res) {
+  if (!GITHUB_WEBHOOK_SECRET) return json(res, 503, { ok: false, error: 'github webhook not configured (set GITHUB_WEBHOOK_SECRET)' });
+  const rawBody = await readBody(req);
+  const signature = req.headers['x-hub-signature-256'] || '';
+  if (!verifyGitHubSignature(rawBody, signature)) {
+    return json(res, 401, { ok: false, error: 'bad github signature' });
+  }
+  const deliveryId = req.headers['x-github-delivery'] || '';
+  if (deliveryId) {
+    if (seenDeliveries.has(deliveryId)) return json(res, 200, { ok: true, ignored: 'duplicate delivery' });
+    seenDeliveries.add(deliveryId);
+    if (seenDeliveries.size > 200) seenDeliveries.clear();
+  }
+  const event = req.headers['x-github-event'] || '';
+  if (event === 'ping') return json(res, 200, { ok: true, event: 'ping' });
+  let payload = {};
+  try { payload = JSON.parse(rawBody); } catch {
+    return json(res, 400, { ok: false, error: 'invalid JSON payload' });
+  }
+  const repo = payload.repository?.full_name || '';
+  if (repo && !GITHUB_WEBHOOK_REPOS.includes(repo)) {
+    return json(res, 200, { ok: true, ignored: `repo not allowed: ${repo}` });
+  }
+  const text = formatGitHubEvent(event, payload);
+  if (!text) return json(res, 200, { ok: true, ignored: `unsupported event: ${event}` });
+  const msg = addMessage({ sender: 'github', text, source: 'github-webhook' });
+  console.log(`[github] #${msg.id} ${event} ${repo}`);
+  forwardToTelegram(msg);
+  return json(res, 200, { ok: true, message: msg });
+}
+
+// ---------- Scheduled reminders + digest (v1.3.0) ----------
+// Mỗi sáng lúc DIGEST_TIME (giờ địa phương của máy chạy bridge), server tự
+// đăng 1 tin digest: các task đang mở (todo/doing) theo từng assignee, và
+// nhắc riêng các task đã quá DIGEST_REMINDER_HOURS giờ chưa cập nhật. Ngày
+// nào không có task mở thì không đăng (tránh spam). Ngày đã đăng được ghi
+// vào digest-state.json để restart server cũng không đăng trùng.
+let lastDigestDate = null;
+try {
+  lastDigestDate = JSON.parse(fs.readFileSync(DIGEST_STATE_FILE, 'utf8')).lastDigestDate || null;
+} catch { /* first run: no state yet */ }
+
+function localDayKey(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function openTasks() {
+  return messages.filter((m) => m.task && (m.task.status === 'todo' || m.task.status === 'doing'));
+}
+
+function buildDigestText() {
+  const open = openTasks();
+  if (open.length === 0) return null;
+  const staleMs = DIGEST_REMINDER_HOURS * 3_600_000;
+  const stale = open.filter((m) => Date.now() - new Date(m.ts).getTime() > staleMs);
+  const byAssignee = {};
+  for (const m of open) {
+    const key = m.task.assignee || 'chưa giao';
+    (byAssignee[key] = byAssignee[key] || []).push(m);
+  }
+  const lines = [`Digest ${localDayKey()} — ${open.length} task đang mở:`];
+  for (const [assignee, list] of Object.entries(byAssignee)) {
+    lines.push('', `${assignee} (${list.length}):`);
+    for (const m of list) {
+      lines.push(`  #${m.id} [${m.task.status}] ${m.sender}: ${String(m.text).split('\n')[0].slice(0, 80)}`);
+    }
+  }
+  if (stale.length > 0) {
+    lines.push('', `Nhắc: ${stale.length} task quá ${DIGEST_REMINDER_HOURS}h chưa cập nhật: ${stale.map((m) => `#${m.id}`).join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+function digestDueNow(now = new Date()) {
+  if (!DIGEST_ENABLED) return false;
+  const [hh, mm] = DIGEST_TIME.split(':').map((n) => Number(n) || 0);
+  const target = new Date(now);
+  target.setHours(hh, mm, 0, 0);
+  return now >= target && lastDigestDate !== localDayKey(now);
+}
+
+// force=true: đăng ngay bất kể giờ (dùng cho POST /api/digest). Trả về
+// {posted, reason?, message?} để route quyết định status code.
+function triggerDigest(force = false) {
+  if (!force && !digestDueNow()) return { posted: false, reason: 'not due yet' };
+  const text = buildDigestText();
+  if (!text) return { posted: false, reason: 'no open tasks' };
+  const msg = addMessage({ sender: 'bridge', text, source: 'digest' });
+  lastDigestDate = localDayKey();
+  try { fs.writeFileSync(DIGEST_STATE_FILE, JSON.stringify({ lastDigestDate }) + '\n'); } catch (e) {
+    console.error('[digest] could not save state:', e.message);
+  }
+  console.log(`[digest] #${msg.id} posted (${openTasks().length} open tasks)`);
+  forwardToTelegram(msg);
+  return { posted: true, message: msg };
+}
+
+function checkDigestDue() {
+  try {
+    const r = triggerDigest(false);
+    if (r.posted) console.log('[digest] morning digest posted');
+  } catch (e) {
+    console.error('[digest] error:', e.message);
+  }
+}
+
 // Poll getUpdates, ingest Martin's Telegram messages into the mailbox.
 // Loop-safe: messages the bridge itself sent via sendMessage do NOT come
 // back through getUpdates, and we ignore any message from a bot.
@@ -428,7 +621,7 @@ ${rows}
   <textarea name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại..." required></textarea><br><br>
   <button type="submit">Gửi</button>
 </form>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -525,6 +718,60 @@ const server = http.createServer(async (req, res) => {
       lastTelegramError,
       outbox: outbox.length,
       sseClients: sseClients.size,
+      githubWebhook: Boolean(GITHUB_WEBHOOK_SECRET),
+      digest: { enabled: DIGEST_ENABLED, time: DIGEST_TIME, lastDigestDate, openTasks: openTasks().length },
+      watchdog: readWatchdogHeartbeat(),
+    });
+  }
+
+  // Public status page (v1.3.0): Martin xem bridge + tunnel đang sống hay
+  // chết mà không cần token. Không lộ token hay nội dung thread.
+  if (p === '/status' && req.method === 'GET') {
+    const wd = readWatchdogHeartbeat();
+    const wdRows = wd
+      ? `<tr><td>Watchdog kiểm tra cuối</td><td>${esc(wd.checkedAt || '—')}</td></tr>
+      <tr><td>Bridge (theo watchdog)</td><td>${wd.bridgeOk ? 'đang chạy' : 'CHẾT / không phản hồi'}</td></tr>
+      <tr><td>Cloudflared (theo watchdog)</td><td>${wd.cloudflaredOk ? 'đang chạy' : 'CHẾT / không phản hồi'}</td></tr>
+      <tr><td>Watchdog đã restart</td><td>${esc(String(wd.restarts ?? 0))} lần</td></tr>
+      <tr><td>Cảnh báo Telegram cuối</td><td>${esc(wd.lastAlertAt || 'chưa có')}</td></tr>`
+      : `<tr><td>Watchdog</td><td>chưa chạy lần nào (xem deploy/watchdog.sh)</td></tr>`;
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    return res.end(`<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
+<title>Muse Bridge — Status</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:640px;margin:24px auto;padding:0 16px">
+<h1>Muse Bridge — Status</h1>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><td>Version</td><td>${esc(VERSION)}</td></tr>
+<tr><td>Đang chạy từ</td><td>${esc(startedAt)} (uptime ${Math.round(process.uptime())}s)</td></tr>
+<tr><td>Tin nhắn</td><td>${messages.length} (task đang mở: ${openTasks().length})</td></tr>
+<tr><td>Telegram</td><td>${telegramEnabled ? 'BẬT' : 'TẮT'}</td></tr>
+<tr><td>Telegram poll cuối</td><td>${esc(lastTelegramPollAt || 'chưa poll')}</td></tr>
+<tr><td>Lỗi Telegram cuối</td><td>${esc(lastTelegramError || 'không có')}</td></tr>
+<tr><td>Outbox chờ gửi lại</td><td>${outbox.length}</td></tr>
+<tr><td>GitHub webhook</td><td>${GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT (chưa đặt GITHUB_WEBHOOK_SECRET)'}</td></tr>
+<tr><td>Digest sáng</td><td>${DIGEST_ENABLED ? `BẬT — ${esc(DIGEST_TIME)} (đã đăng gần nhất: ${esc(lastDigestDate || 'chưa')})` : 'TẮT'}</td></tr>
+${wdRows}
+</table>
+<p style="color:#888;font-size:12px">JSON: <a href="/api/status">/api/status</a> · Health: <a href="/health">/health</a></p>
+</body></html>`);
+  }
+
+  if (p === '/api/status' && req.method === 'GET') {
+    return json(res, 200, {
+      ok: true,
+      version: VERSION,
+      startedAt,
+      uptime_s: Math.round(process.uptime()),
+      messages: messages.length,
+      openTasks: openTasks().length,
+      telegram: telegramEnabled,
+      lastTelegramPollAt,
+      lastTelegramError,
+      outbox: outbox.length,
+      sseClients: sseClients.size,
+      githubWebhook: Boolean(GITHUB_WEBHOOK_SECRET),
+      digest: { enabled: DIGEST_ENABLED, time: DIGEST_TIME, lastDigestDate },
+      watchdog: readWatchdogHeartbeat(),
     });
   }
 
@@ -619,6 +866,37 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, audit: auditEntries.slice(-limit) });
   }
 
+  // Digest preview (v1.3.0): GET /api/digest?token=... — xem trước nội dung
+  // digest sẽ đăng, không đăng thật.
+  if (p === '/api/digest' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const text = buildDigestText();
+    return json(res, 200, { ok: true, due: digestDueNow(), openTasks: openTasks().length, text });
+  }
+
+  // Trigger digest ngay (v1.3.0): POST /api/digest {"token"} — đăng digest
+  // bất kể giờ, để Martin hoặc Muse kích hoạt thủ công khi cần.
+  if (p === '/api/digest' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = triggerDigest(true);
+    if (!r.posted) return json(res, 200, { ok: true, posted: false, reason: r.reason });
+    return json(res, 200, { ok: true, posted: true, message: r.message });
+  }
+
+  // GitHub webhook (v1.3.0): POST /api/github-webhook — xem
+  // handleGitHubWebhook ở trên. Không dùng token của board, dùng chữ ký
+  // HMAC với GITHUB_WEBHOOK_SECRET.
+  if (p === '/api/github-webhook' && req.method === 'POST') {
+    return handleGitHubWebhook(req, res);
+  }
+
   if (p === '/api/msg' && req.method === 'POST') {
     if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
     let data = {};
@@ -685,6 +963,12 @@ server.listen(PORT, HOST, () => {
   console.log(`Telegram: ${telegramEnabled ? `BẬT — chat_id=${TELEGRAM_CHAT_ID}` : 'TẮT — chưa có TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID trong .env (mailbox web vẫn chạy)'}`);
   console.log(`Token expires: ${tokenExpiresAt ? tokenExpiresAt.toISOString() : 'không giới hạn'}`);
   console.log(`Expose ra ngoài cho Muse:    cloudflared tunnel --url http://127.0.0.1:${PORT}`);
-  console.log(`Health: http://${HOST}:${PORT}/health\n`);
+  console.log(`Health: http://${HOST}:${PORT}/health`);
+  console.log(`Status: http://${HOST}:${PORT}/status`);
+  console.log(`GitHub webhook: ${GITHUB_WEBHOOK_SECRET ? `BẬT — POST /api/github-webhook (repos: ${GITHUB_WEBHOOK_REPOS.join(', ')})` : 'TẮT — chưa đặt GITHUB_WEBHOOK_SECRET'}`);
+  console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
+  // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
+  setInterval(checkDigestDue, 60_000);
+  checkDigestDue();
 });

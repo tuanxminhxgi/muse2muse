@@ -1,0 +1,19 @@
+# Cài đặt (trên PC của Martin — sửa User/đường dẫn nếu máy bạn khác):
+#   sudo cp deploy/muse-watchdog.service deploy/muse-watchdog.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now muse-watchdog.timer
+# Kiểm tra: systemctl list-timers | grep muse-watchdog
+# Xem log:  journalctl -u muse-watchdog.service -f
+# Timer chạy watchdog.sh mỗi 2 phút; script tự ghi heartbeat vào watchdog.json
+# để GET /status hiển thị. Xem deploy/watchdog.sh để biết chi tiết.
+[Unit]
+Description=Muse Bridge watchdog (checks bridge + cloudflared every 2 min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Sửa theo máy của bạn nếu khác (mặc định là đường dẫn trên PC của Martin).
+User=martin
+WorkingDirectory=/home/martin/Desktop/project/muse2muse
+ExecStart=/bin/bash /home/martin/Desktop/project/muse2muse/deploy/watchdog.sh
