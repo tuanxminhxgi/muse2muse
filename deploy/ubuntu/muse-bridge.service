@@ -1,0 +1,20 @@
+[Unit]
+Description=Muse Telegram Bridge - mailbox for Muse A and Muse B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=martin
+WorkingDirectory=/home/martin/muse2muse
+EnvironmentFile=/etc/muse-bridge.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Cloudflared tunnel for Muse Bridge
+After=network-online.target muse-bridge.service
+Wants=network-online.target muse-bridge.service
+
+[Service]
+Type=simple
+User=martin
+ExecStart=/usr/bin/cloudflared tunnel --url http://127.0.0.1:8797
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
