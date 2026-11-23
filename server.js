@@ -153,6 +153,38 @@
 //      Cờ kiểm tra rủi ro phía Muse (execution-risk flag) vẫn cần lời
 //      xác nhận trực tiếp của Martin — nút Telegram không bấm hộ được.
 //
+// v1.10.0 (Muse C: 2 task từ tin #212/#216 — Martin chọn 4 task ở #212,
+// Muse A giao review chéo PR tự động + hàng đợi ưu tiên/bình chọn idea
+// cho Muse C ở #216; Martin xác nhận trực tiếp ở #223):
+//   1) Review chéo PR tự động: webhook GitHub (POST /api/github-webhook)
+//      nhận event pull_request opened/synchronize/reopened/
+//      ready_for_review → bridge tự đăng 1 tin review lên thread (type
+//      status, reply_to tin PR) với người review là Muse khác tác giả
+//      (tác giả suy từ tên nhánh implement-<a|b|c>-…; không rõ thì
+//      muse-a review mặc định; b→c, c→a, a→b). Review kiểm tra bằng dữ
+//      liệu sẵn trong payload webhook (số file đổi, +/− dòng, draft,
+//      mergeable): conflict → CẦN XEM LẠI, diff > 800 dòng → xem kỹ,
+//      còn lại → OK để Martin merge. Chưa phải review code thật bằng AI.
+//      Có GITHUB_TOKEN thì lấy thêm danh sách file đổi qua GitHub API
+//      (cờ file rủi ro: package.json, .env, workflow) và đăng review
+//      thành comment lên PR; không có token thì chỉ review trên thread.
+//      Mỗi PR + head sha chỉ review 1 lần (chống gửi lại webhook).
+//      Tắt bằng AUTO_REVIEW_ENABLED=false. GET /api/reviews?token=
+//      liệt kê các review tự động gần nhất.
+//   2) Hàng đợi ưu tiên + bình chọn idea: task có thêm priority
+//      (high|medium|low, mặc định medium) — đặt lúc gửi tin (form board
+//      + POST /api/msg) hoặc đổi bằng PATCH /api/messages/:id/task;
+//      GET /api/tasks?priority= lọc theo ưu tiên. Mỗi tin bình chọn
+//      được (👍): POST /api/messages/:id/vote {"token","voter"} bật/tắt
+//      vote của voter (muse-a|muse-b|muse-c|martin), form
+//      POST /b/<token>/vote và lệnh Telegram /vote <id> làm tương tự;
+//      số vote lưu trên tin (voted_by) nên sống qua restart. Board có
+//      chế độ xem ?view=queue: task đang mở xếp theo ưu tiên rồi số vote,
+//      tiếp theo là ideas được bình chọn (tin của Muse/Martin, không
+//      phải task, có vote) xếp theo vote. GET /api/queue?token= và
+//      GET /api/ideas?token=&sort=votes|new trả cùng dữ liệu dạng JSON.
+//      Không thêm field hay file mới ngoài voted_by / priority trên tin.
+//
 // Ghi chú: lúc làm v1.9.0, nội dung repo lại bị gắn cờ execution-risk
 // (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
 // board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
@@ -170,7 +202,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.9.0';
+const VERSION = '1.10.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -235,6 +267,14 @@ const TASK_REMINDER_ENABLED = (process.env.TASK_REMINDER_ENABLED || 'true').toLo
 // (repo scope). Chỉ dùng để merge PR khi Martin bấm nút 🔀 Merge / gõ
 // /merge — không có token thì nút chỉ ghi quyết định + trả link merge tay.
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
+// Review chéo PR tự động (v1.10.0): AUTO_REVIEW_ENABLED=false tắt hẳn.
+// REVIEW_LARGE_LINES: diff vượt ngưỡng này thì review cờ "diff lớn".
+const AUTO_REVIEW_ENABLED = (process.env.AUTO_REVIEW_ENABLED || 'true').toLowerCase() !== 'false';
+const REVIEW_LARGE_LINES = 800;
+// Nhánh không theo mẫu implement-<a|b|c>-… nhưng biết chắc tác giả
+// (đặt tay khi gặp): implement-group3 và implement-idea4-saved đều là
+// nhánh của Muse C.
+const KNOWN_BRANCH_AUTHORS = { 'implement-group3': 'muse-c', 'implement-idea4-saved': 'muse-c' };
 const MUSES = ['muse-a', 'muse-b', 'muse-c'];
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -245,7 +285,14 @@ const SENDERS = ['muse-a', 'muse-b', 'muse-c', 'martin', 'user', 'telegram', 'gi
 const TASK_ASSIGNEES = ['muse-a', 'muse-b', 'muse-c', 'martin'];
 // Trạng thái task (v1.9.0 thêm 'review'): claim → doing → review → done.
 // Xem TASK_TRANSITIONS bên dưới — chỉ chuyển theo các bước cho phép.
+// Ưu tiên task (v1.10.0): high|medium|low, mặc định medium khi không đặt;
+// tin cũ không có priority vẫn đọc bình thường, coi như medium.
 const TASK_STATUSES = ['todo', 'doing', 'review', 'done', 'blocked'];
+const TASK_PRIORITIES = ['high', 'medium', 'low'];
+const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
+// Ai được bình chọn (v1.10.0): 3 Muse + Martin. Mỗi người chỉ vote 1 lần
+// / tin — bấm lại là rút vote (toggle), không cộng dồn.
+const VOTERS = ['muse-a', 'muse-b', 'muse-c', 'martin'];
 // Tin có cấu trúc (v1.5.0): type phân loại tin; reply_to trỏ tới tin được
 // trả lời; deadline (trong task) là hạn chót ISO date. @mention nhắc đúng
 // Muse cần đọc — MENTIONABLES gồm cả martin để hiện chip trên board, còn
@@ -436,7 +483,9 @@ function normalizeTask(input) {
     ? null : String(input.status);
   const deadline = input.deadline === undefined || input.deadline === null || input.deadline === ''
     ? null : String(input.deadline);
-  if (assignee === null && status === null && deadline === null) return null;
+  const priority = input.priority === undefined || input.priority === null || input.priority === ''
+    ? null : String(input.priority);
+  if (assignee === null && status === null && deadline === null && priority === null) return null;
   if (assignee !== null && !TASK_ASSIGNEES.includes(assignee)) {
     throw new Error('assignee must be muse-a|muse-b|muse-c|martin');
   }
@@ -446,7 +495,10 @@ function normalizeTask(input) {
   if (deadline !== null && Number.isNaN(Date.parse(deadline))) {
     throw new Error('deadline must be an ISO date, e.g. 2026-11-30');
   }
-  const task = { assignee, status: status || 'todo' };
+  if (priority !== null && !TASK_PRIORITIES.includes(priority)) {
+    throw new Error('priority must be high|medium|low');
+  }
+  const task = { assignee, status: status || 'todo', priority: priority || 'medium' };
   if (deadline !== null) task.deadline = deadline;
   return task;
 }
@@ -708,6 +760,7 @@ const TASK_COMMANDS_HELP = [
   '/release <id> — nhả khóa task',
   '/approve <n> — duyệt PR #n của muse2muse (ghi quyết định lên thread)',
   '/merge <n> — merge PR #n (cần GITHUB_TOKEN, chưa có thì trả link merge tay)',
+  '/vote <id> — Martin bình chọn / rút vote cho tin #id',
   '/help — xem lại danh sách này',
 ].join('\n');
 
@@ -742,6 +795,10 @@ function parseTelegramCommand(text) {
     const id = Number(parts[1]);
     return Number.isInteger(id) && id > 0 ? { cmd: 'release', id } : { cmd: 'bad', error: 'id phải là số, ví dụ /release 12' };
   }
+  if (cmd === '/vote' && parts.length === 2) {
+    const id = Number(parts[1]);
+    return Number.isInteger(id) && id > 0 ? { cmd: 'vote', id } : { cmd: 'bad', error: 'id phải là số, ví dụ /vote 12' };
+  }
   // /approve <n> hoặc /approve <owner/repo> <n> (mặc định repo muse2muse);
   // tương tự /merge. Số PR phải là số nguyên dương.
   if ((cmd === '/approve' || cmd === '/merge') && (parts.length === 2 || parts.length === 3)) {
@@ -751,7 +808,7 @@ function parseTelegramCommand(text) {
     if (!Number.isInteger(number) || number <= 0) return { cmd: 'bad', error: 'số PR phải là số, ví dụ /approve 11' };
     return { cmd: cmd.slice(1), repo, number };
   }
-  if (['/tasks', '/done', '/assign', '/status', '/claim', '/release', '/approve', '/merge', '/help'].includes(cmd)) {
+  if (['/tasks', '/done', '/assign', '/status', '/claim', '/release', '/approve', '/merge', '/vote', '/help'].includes(cmd)) {
     return { cmd: 'bad', error: `sai cú pháp. Gõ /help để xem cách dùng.` };
   }
   return null; // lệnh lạ (không phải của bridge) — bỏ qua, không đưa vào mailbox
@@ -882,6 +939,15 @@ async function handleTelegramCommand(parsed) {
       : `[telegram] Martin đã nhả khóa task #${m.id} [${m.task.status}]: ${String(m.text).split('\n')[0].slice(0, 100)}`;
     const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
     console.log(`[telegram] command #${msg.id} ${parsed.cmd} #${m.id}`);
+    return confirm;
+  }
+  if (parsed.cmd === 'vote') {
+    const r = toggleVote(parsed.id, 'martin');
+    if (!r.ok) return r.error;
+    const m = r.message;
+    const confirm = `[telegram] Martin ${r.voted ? 'đã bình chọn' : 'đã rút vote'} cho tin #${m.id} (👍 ${voteCount(m)}): ${String(m.text).split('\n')[0].slice(0, 100)}`;
+    const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
+    console.log(`[telegram] command #${msg.id} vote #${m.id} voted=${r.voted}`);
     return confirm;
   }
   // Sửa lỗi có từ v1.4.0: /done parse ra {cmd:'done', id} mà không có
@@ -1113,6 +1179,17 @@ async function getBoardStatus() {
       lockedTasks: messages.filter((m) => m.task?.lockedBy && !lockStale(m.task)).length,
       staleLocks: messages.filter((m) => m.task?.lockedBy && lockStale(m.task)).length,
     },
+    // Hàng đợi ưu tiên + review tự động (v1.10.0): tóm tắt để panel và
+    // /api/board-status hiện mà không cần gọi thêm endpoint.
+    queue: (() => {
+      const q = buildQueue();
+      return {
+        openTasks: q.tasks.length,
+        highPriority: q.tasks.filter((m) => taskPriority(m.task) === 'high').length,
+        topIdeas: q.ideas.slice(0, 5).map((m) => ({ id: m.id, votes: voteCount(m) })),
+      };
+    })(),
+    autoReview: { enabled: AUTO_REVIEW_ENABLED },
     presence: presenceStatus(),
   };
 }
@@ -1212,6 +1289,135 @@ function buildGitHubMeta(event, payload) {
   return null;
 }
 
+// ---------- Review chéo PR tự động (v1.10.0) ----------
+// Tác giả suy từ tên nhánh head: implement-<a|b|c>-… (hoặc nhánh đã biết
+// trong KNOWN_BRANCH_AUTHORS). Người review là Muse kế tiếp trong vòng
+// a→b→c→a — không bao giờ tự review PR của mình. Không xác định được tác
+// giả thì muse-a (điều phối) review mặc định.
+function authorFromBranch(head) {
+  const h = String(head || '');
+  const m = h.match(/^implement-([abc])(?:[-_]|$)/);
+  if (m) return `muse-${m[1]}`;
+  return KNOWN_BRANCH_AUTHORS[h] || null;
+}
+function reviewerFor(author) {
+  if (!author || !MUSES.includes(author)) return 'muse-a';
+  return MUSES[(MUSES.indexOf(author) + 1) % MUSES.length];
+}
+// Cờ file rủi ro khi có danh sách file đổi (chỉ khi GITHUB_TOKEN đã đặt
+// để gọi API): đổi dependency, secret/env, workflow CI, hoặc sửa file
+// nhạy cảm khác.
+const RISKY_FILE_RES = [
+  { re: /(^|\/)package\.json$/, label: 'đổi package.json (dependency)' },
+  { re: /(^|\/)\.env(\.|$)/, label: 'đụng file .env' },
+  { re: /(^|\/)\.github\/workflows\//, label: 'đổi workflow CI' },
+  { re: /(^|\/)token\.txt$/, label: 'đụng token.txt' },
+];
+// Lấy danh sách file đổi của PR qua GitHub API. Cần GITHUB_TOKEN; không
+// có token thì trả null để review chỉ dùng số liệu trong payload webhook.
+async function fetchPrFiles(repo, number) {
+  if (!GITHUB_TOKEN) return null;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${number}/files?per_page=100`, {
+      signal: AbortSignal.timeout(10_000),
+      headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${GITHUB_TOKEN}`, 'user-agent': 'muse-bridge' },
+    });
+    if (!res.ok) return null;
+    const list = await res.json();
+    return (Array.isArray(list) ? list : []).map((f) => ({
+      filename: f.filename || '', additions: f.additions || 0, deletions: f.deletions || 0, status: f.status || '',
+    }));
+  } catch { return null; }
+}
+// Đăng review thành comment lên PR (chỉ khi có GITHUB_TOKEN). Lỗi thì
+// trả {ok:false} — review trên thread vẫn là bản chính.
+async function postPrReviewComment(repo, number, body) {
+  if (!GITHUB_TOKEN) return { ok: false, error: 'chưa đặt GITHUB_TOKEN' };
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/issues/${number}/comments`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(10_000),
+      headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${GITHUB_TOKEN}`, 'user-agent': 'muse-bridge' },
+      body: JSON.stringify({ body }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return { ok: false, error: data.message || `GitHub trả ${res.status}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+// Soạn nội dung review từ payload PR + (nếu có) danh sách file đổi.
+// Chỉ kiểm tra tự động bằng số liệu — không thay review code thật.
+function buildReviewText({ repo, pr, files }) {
+  const number = pr.number;
+  const changedFiles = typeof pr.changed_files === 'number' ? pr.changed_files : (files ? files.length : null);
+  const additions = typeof pr.additions === 'number' ? pr.additions : (files ? files.reduce((s, f) => s + f.additions, 0) : null);
+  const deletions = typeof pr.deletions === 'number' ? pr.deletions : (files ? files.reduce((s, f) => s + f.deletions, 0) : null);
+  const total = (additions ?? 0) + (deletions ?? 0);
+  const flags = [];
+  if (pr.draft) flags.push('PR đang draft — chưa sẵn sàng merge');
+  if (pr.mergeable === false) flags.push('đang conflict với base — chưa merge được, cần rebase/sửa conflict');
+  if (changedFiles === 0) flags.push('không có file nào đổi');
+  if (total > REVIEW_LARGE_LINES) flags.push(`diff lớn (${total} dòng đổi) — nên xem kỹ từng file, cân nhắc chia nhỏ PR`);
+  if (files) {
+    for (const f of files) {
+      for (const r of RISKY_FILE_RES) {
+        if (r.re.test(f.filename)) flags.push(r.label + `: ${f.filename}`);
+      }
+    }
+  }
+  const verdict = flags.length > 0 ? 'CẦN XEM LẠI' : 'OK';
+  const lines = [
+    `[review] PR #${number} (${repo}) — "${pr.title || ''}"`,
+    `File đổi: ${changedFiles ?? '?'} · +${additions ?? '?'} / -${deletions ?? '?'} dòng · ${pr.commits ?? '?'} commit · ${pr.head?.ref || '?'} → ${pr.base?.ref || '?'}`,
+  ];
+  if (files && files.length > 0) {
+    const top = files.slice(0, 10).map((f) => `${f.filename} (+${f.additions}/-${f.deletions})`).join(', ');
+    lines.push(`File chính: ${top}${files.length > 10 ? ` (+${files.length - 10} file nữa)` : ''}`);
+  }
+  if (flags.length > 0) lines.push(`Cờ kiểm tra: ${flags.map((f, i) => `${i + 1}. ${f}`).join(' | ')}`);
+  lines.push(`Kết luận tự động: ${verdict}${verdict === 'OK' ? ' — để Martin merge.' : ' — xem các cờ trên trước khi merge.'}`);
+  lines.push(pr.html_url || '');
+  return { verdict, text: lines.filter(Boolean).join('\n') };
+}
+// Mỗi PR + head sha chỉ review 1 lần — GitHub gửi lại webhook khi lỗi,
+// và mỗi lần push thêm commit (synchronize) có sha mới thì review lại.
+const seenReviews = new Set();
+// Chạy sau khi tin PR đã đăng lên thread. Không throw — lỗi thì chỉ log,
+// webhook vẫn trả 200 vì tin PR đã đăng xong.
+async function maybeAutoReview({ event, payload, prMessage }) {
+  if (!AUTO_REVIEW_ENABLED) return;
+  if (event !== 'pull_request') return;
+  const action = payload.action || '';
+  if (!['opened', 'synchronize', 'reopened', 'ready_for_review'].includes(action)) return;
+  const pr = payload.pull_request || {};
+  const repo = payload.repository?.full_name || '';
+  if (!pr.number || !repo) return;
+  const headSha = String(pr.head?.sha || '');
+  const key = `${repo}#${pr.number}@${headSha}`;
+  if (seenReviews.has(key)) return;
+  seenReviews.add(key);
+  if (seenReviews.size > 200) seenReviews.clear();
+  const author = authorFromBranch(pr.head?.ref);
+  const reviewer = reviewerFor(author);
+  const files = await fetchPrFiles(repo, pr.number);
+  const { verdict, text } = buildReviewText({ repo, pr, files });
+  const header = author
+    ? `[review tự động] ${reviewer} review chéo PR của ${author} (action: ${action})`
+    : `[review tự động] ${reviewer} review PR (không xác định được tác giả theo tên nhánh, muse-a review mặc định — action: ${action})`;
+  const reviewMsg = addMessage({
+    sender: reviewer, text: `${header}\n${text}`,
+    source: 'github-webhook', type: 'status', reply_to: prMessage.id,
+  });
+  console.log(`[review] #${reviewMsg.id} ${reviewer} -> PR ${repo}#${pr.number}: ${verdict}`);
+  forwardToTelegram(reviewMsg);
+  const r = await postPrReviewComment(repo, pr.number, `${header}\n\n${text}\n\n— Review tự động từ Muse Bridge (chỉ kiểm tra số liệu, không thay review code thật).`);
+  if (!r.ok && GITHUB_TOKEN) console.log(`[review] không comment được lên PR ${repo}#${pr.number}: ${r.error}`);
+}
+
 async function handleGitHubWebhook(req, res) {
   if (!GITHUB_WEBHOOK_SECRET) return json(res, 503, { ok: false, error: 'github webhook not configured (set GITHUB_WEBHOOK_SECRET)' });
   const rawBody = await readBody(req);
@@ -1240,6 +1446,12 @@ async function handleGitHubWebhook(req, res) {
   const msg = addMessage({ sender: 'github', text, source: 'github-webhook', github: buildGitHubMeta(event, payload) });
   console.log(`[github] #${msg.id} ${event} ${repo}`);
   forwardToTelegram(msg);
+  // Review chéo PR tự động (v1.10.0): PR mở/cập nhật thì Muse khác tác
+  // giả đăng review kiểm tra tự động lên thread. Chạy nền, không chặn
+  // trả webhook; lỗi thì chỉ log vì tin PR đã đăng xong.
+  if (event === 'pull_request') {
+    maybeAutoReview({ event, payload, prMessage: msg }).catch((e) => console.error('[review] error:', e.message));
+  }
   // Auto-deploy (v1.4.0): cùng 1 webhook này vừa đăng tin vừa deploy khi
   // push / PR-merge vào DEPLOY_BRANCH của repo muse2muse. Martin chỉ cần
   // cấu hình 1 webhook duy nhất tới /api/github-webhook.
@@ -1304,6 +1516,64 @@ function setPinned(id, pinned) {
   appendAudit({ action: 'message.pin', sender: null, messageId: msg.id, source: 'api' });
   broadcastMessage(msg);
   return msg;
+}
+
+// ---------- Bình chọn + hàng đợi ưu tiên (v1.10.0) ----------
+// Vote lưu ngay trên tin: voted_by = [voter...] (mỗi người tối đa 1 lần,
+// bấm lại là rút vote). Tin cũ không có voted_by thì coi như 0 vote.
+// taskPriority: tin cũ không có priority thì coi như medium.
+// Idea = tin do Muse/Martin viết, không phải task, không phải tin hệ
+// thống GitHub/Telegram/bridge, không phải quyết định đã chốt.
+function voteCount(m) {
+  return Array.isArray(m.voted_by) ? m.voted_by.length : 0;
+}
+function taskPriority(task) {
+  return TASK_PRIORITIES.includes(task?.priority) ? task.priority : 'medium';
+}
+function isIdeaMessage(m) {
+  return (MUSES.includes(m.sender) || m.sender === 'martin')
+    && !m.task && !m.github && m.type !== 'decision';
+}
+// Bật/tắt vote của voter trên tin #id. Trả {ok, message, voted} hoặc
+// {ok:false, code, error} để handler map sang HTTP status.
+function toggleVote(id, voter) {
+  if (!VOTERS.includes(voter)) {
+    return { ok: false, code: 'bad_voter', error: 'voter must be muse-a|muse-b|muse-c|martin' };
+  }
+  const msg = messages.find((m) => m.id === id);
+  if (!msg) return { ok: false, code: 'not_found', error: 'message not found' };
+  msg.voted_by = Array.isArray(msg.voted_by) ? msg.voted_by : [];
+  const at = msg.voted_by.indexOf(voter);
+  let voted;
+  if (at === -1) { msg.voted_by.push(voter); voted = true; }
+  else { msg.voted_by.splice(at, 1); voted = false; }
+  if (msg.voted_by.length === 0) delete msg.voted_by;
+  persistMessages();
+  appendAudit({ action: voted ? 'message.vote' : 'message.unvote', sender: voter, messageId: msg.id, source: 'api' });
+  broadcastMessage(msg);
+  return { ok: true, message: msg, voted };
+}
+// Hàng đợi ưu tiên: task đang mở (chưa done) xếp theo ưu tiên (high
+// trước) rồi số vote, rồi id; tiếp theo là ideas có vote xếp theo vote.
+// Trả thẳng object tin (đã có đủ field để board/API dùng).
+function buildQueue() {
+  const tasks = messages
+    .filter((m) => m.task && m.task.status !== 'done')
+    .slice()
+    .sort((a, b) => (PRIORITY_RANK[taskPriority(a.task)] - PRIORITY_RANK[taskPriority(b.task)])
+      || (voteCount(b) - voteCount(a)) || (a.id - b.id));
+  const ideas = messages
+    .filter((m) => isIdeaMessage(m) && voteCount(m) > 0)
+    .slice()
+    .sort((a, b) => (voteCount(b) - voteCount(a)) || (b.id - a.id))
+    .slice(0, 20);
+  return { tasks, ideas };
+}
+function listIdeas(sort) {
+  const list = messages.filter(isIdeaMessage).slice();
+  if (sort === 'new') list.sort((a, b) => b.id - a.id);
+  else list.sort((a, b) => (voteCount(b) - voteCount(a)) || (b.id - a.id));
+  return list;
 }
 
 function buildDigestText() {
@@ -1662,7 +1932,17 @@ function taskBadge(m) {
   const lock = m.task.lockedBy
     ? ` · 🔒 ${esc(m.task.lockedBy)}${lockStale(m.task) ? ' (khóa hết hạn)' : ''}`
     : '';
-  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}${lock}]</span>`;
+  // Ưu tiên (v1.10.0): chỉ hiện khi high/low — medium là mặc định, không
+  // cần chiếm chỗ trên badge.
+  const priority = taskPriority(m.task) !== 'medium' ? ` · ưu tiên ${esc(taskPriority(m.task))}` : '';
+  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}${lock}${priority}]</span>`;
+}
+
+// Số vote (v1.10.0): chỉ hiện khi có ít nhất 1 vote.
+function voteBadge(m) {
+  const n = voteCount(m);
+  if (n === 0) return '';
+  return ` <span style="background:#dcfce7;border:1px solid #86efac;border-radius:4px;padding:1px 6px;font-size:12px">👍 ${n}</span>`;
 }
 
 // @mention + read receipt (v1.5.0): chip @muse-b... và dòng "Đã đọc: ...".
@@ -1741,6 +2021,7 @@ function renderActions(m) {
   return `<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">`
     + `<button type="button" data-action="reply" data-id="${m.id}" title="Trả lời tin #${m.id} (điền vào form bên dưới)">Trả lời</button>`
     + ` <button type="button" data-action="read" data-id="${m.id}" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>`
+    + ` <button type="button" data-action="vote" data-id="${m.id}" title="Bình chọn / rút vote cho tin #${m.id} (theo sender đang chọn trong form)">👍 Bình chọn${voteCount(m) ? ` (${voteCount(m)})` : ''}</button>`
     + (statusBtns ? ` ${statusBtns}` : '') + assignSelect + claimBtns
     + ` <button type="button" data-action="copy" data-id="${m.id}" title="Copy link tới tin #${m.id}">Copy link</button>`
     + `</div>`;
@@ -1754,12 +2035,26 @@ function renderRow(m) {
     <input type="hidden" name="pinned" value="${m.pinned ? '0' : '1'}">
     <button type="submit" style="font-size:12px">${m.pinned ? 'Bỏ ghim' : 'Ghim'}</button>
   </form>`;
+  // Bình chọn không cần JS (v1.10.0): form chọn người vote rồi bấm 👍;
+  // có JS thì nút "👍 Bình chọn" trong thao tác nhanh dùng sender đang
+  // chọn trong form soạn tin, không cần chọn lại ở đây.
+  const voteForm = `<form method="POST" action="/b/${esc(BRIDGE_TOKEN)}/vote" style="display:inline;margin:0">
+    <input type="hidden" name="id" value="${m.id}">
+    <select name="voter" style="font-size:12px" title="Bạn là ai? (để bình chọn)">
+      <option value="">— bạn là ai —</option>
+      <option value="muse-a">muse-a</option>
+      <option value="muse-b">muse-b</option>
+      <option value="muse-c">muse-c</option>
+      <option value="martin">martin</option>
+    </select>
+    <button type="submit" style="font-size:12px">👍 Bình chọn${voteCount(m) ? ` (${voteCount(m)})` : ''}</button>
+  </form>`;
   const pinMark = m.pinned ? ` <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">📌 đã ghim</span>` : '';
   const body = `<div style="white-space:pre-wrap;margin-top:4px">${type}${esc(m.text)}</div>${githubDetails(m)}`;
   return `
     <div id="msg-${m.id}" style="margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px">
-      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${mentionBadge(m)}${pinMark}
-      <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span> ${pinBtn}
+      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${voteBadge(m)}${mentionBadge(m)}${pinMark}
+      <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span> ${pinBtn} ${voteForm}
       ${reply}
       ${body}
       ${readBadge(m)}
@@ -1934,9 +2229,38 @@ ${savedFilterForm(filters)}
 ${rows}`;
 }
 
+// Hàng đợi ưu tiên (v1.10.0): task đang mở xếp theo ưu tiên (high trước)
+// rồi số vote, rồi id; tiếp theo là ideas có vote xếp theo vote. Mỗi mục
+// link về tin gốc (#msg-<id>) trong thread.
+function renderQueue() {
+  const q = buildQueue();
+  const taskRow = (m) => {
+    const first = esc(String(m.text).split('\n')[0].slice(0, 120));
+    return `<li><a href="/b/${esc(BRIDGE_TOKEN)}#msg-${m.id}">#${m.id}</a> `
+      + `[${esc(m.task.status)} · ưu tiên ${esc(taskPriority(m.task))}`
+      + `${m.task.assignee ? ` · ${esc(m.task.assignee)}` : ''}`
+      + `${m.task.deadline ? ` · hạn ${esc(m.task.deadline)}` : ''}`
+      + ` · 👍 ${voteCount(m)}] ${first} `
+      + `<span style="color:#888;font-size:12px">${esc(m.sender)} · ${esc(m.ts.slice(0, 10))}</span></li>`;
+  };
+  const ideaRow = (m) => {
+    const first = esc(String(m.text).split('\n')[0].slice(0, 140));
+    return `<li><a href="/b/${esc(BRIDGE_TOKEN)}#msg-${m.id}">#${m.id}</a> `
+      + `[👍 ${voteCount(m)} · ${esc((m.voted_by || []).join(', '))}] ${first} `
+      + `<span style="color:#888;font-size:12px">${esc(m.sender)} · ${esc(m.ts.slice(0, 10))}</span></li>`;
+  };
+  return `<h2>⏫ Hàng đợi ưu tiên (${q.tasks.length} task đang mở)</h2>
+<p style="color:#888;font-size:12px">Xếp theo ưu tiên (high → medium → low), rồi số vote, rồi số tin. Đổi ưu tiên bằng PATCH /api/messages/:id/task {"priority":"high"} hoặc nút trạng thái trên từng tin; bình chọn bằng nút 👍 dưới mỗi tin, lệnh Telegram /vote &lt;id&gt;.</p>
+${q.tasks.length > 0 ? `<ul>${q.tasks.map(taskRow).join('')}</ul>` : '<p><i>Không có task đang mở.</i></p>'}
+<h2>💡 Ideas được bình chọn (${q.ideas.length})</h2>
+<p style="color:#888;font-size:12px">Tin của Muse/Martin (không phải task) có ít nhất 1 vote, xếp theo vote. Xem toàn bộ ideas (kể cả chưa có vote) qua GET /api/ideas?token=…&amp;sort=votes|new.</p>
+${q.ideas.length > 0 ? `<ul>${q.ideas.map(ideaRow).join('')}</ul>` : '<p><i>Chưa có idea nào được bình chọn. Bấm 👍 dưới tin để bình chọn.</i></p>'}`;
+}
+
 async function renderPage(query) {
   const view = query.get('view') === 'kanban' ? 'kanban'
-    : query.get('view') === 'saved' ? 'saved' : 'thread';
+    : query.get('view') === 'saved' ? 'saved'
+    : query.get('view') === 'queue' ? 'queue' : 'thread';
   const filters = {
     assignee: query.get('fassignee') || '',
     status: query.get('fstatus') || '',
@@ -1949,12 +2273,14 @@ async function renderPage(query) {
   };
   const status = await getBoardStatus();
   const rows = messages.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B và Muse C.</i></p>';
-  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`} · ${view === 'saved' ? '<b>📌 Đã ghim</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=saved">📌 Đã ghim</a>`}</p>`;
+  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`} · ${view === 'saved' ? '<b>📌 Đã ghim</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=saved">📌 Đã ghim</a>`} · ${view === 'queue' ? '<b>⏫ Hàng đợi</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=queue">⏫ Hàng đợi</a>`}</p>`;
   const main = view === 'kanban'
     ? `${filterForm(filters)}${renderKanban(filters)}`
     : view === 'saved'
       ? renderSaved(savedFilters)
-      : `<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
+      : view === 'queue'
+        ? renderQueue()
+        : `<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
 <div id="thread">
 ${rows}
 </div>`;
@@ -2014,6 +2340,14 @@ ${main}
       <option value="blocked">blocked</option>
     </select>
   </label>
+  <label> Ưu tiên:
+    <select name="priority">
+      <option value="">— không đặt —</option>
+      <option value="high">high</option>
+      <option value="medium">medium</option>
+      <option value="low">low</option>
+    </select>
+  </label>
   <label> Loại tin:
     <select name="type">
       <option value="">— tự động —</option>
@@ -2036,7 +2370,7 @@ ${main}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -2074,7 +2408,8 @@ ${main}
   function actionsHtml(m) {
     var h = '<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">'
       + '<button type="button" data-action="reply" data-id="' + m.id + '" title="Trả lời tin #' + m.id + '">Trả lời</button>'
-      + ' <button type="button" data-action="read" data-id="' + m.id + '" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>';
+      + ' <button type="button" data-action="read" data-id="' + m.id + '" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>'
+      + ' <button type="button" data-action="vote" data-id="' + m.id + '" title="Bình chọn / rút vote cho tin #' + m.id + ' (theo sender đang chọn trong form)">👍 Bình chọn' + ((m.voted_by && m.voted_by.length) ? ' (' + m.voted_by.length + ')' : '') + '</button>';
     if (m.task) {
       ['todo', 'doing', 'review', 'done', 'blocked'].forEach(function (st) {
         h += ' <button type="button" data-action="status" data-id="' + m.id + '" data-status="' + st + '" title="Đổi task #' + m.id + ' sang ' + st + '">' + st + '</button>';
@@ -2092,10 +2427,14 @@ ${main}
   function rowHtml(m) {
     var badge = '';
     if (m.task) {
+      var pr = (m.task.priority === 'high' || m.task.priority === 'low') ? ' · ưu tiên ' + escHtml(m.task.priority) : '';
       badge = ' <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[' +
         escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') +
         (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') +
-        (m.task.lockedBy ? ' · 🔒 ' + escHtml(m.task.lockedBy) : '') + ']</span>';
+        (m.task.lockedBy ? ' · 🔒 ' + escHtml(m.task.lockedBy) : '') + pr + ']</span>';
+    }
+    if (m.voted_by && m.voted_by.length) {
+      badge += ' <span style="background:#dcfce7;border:1px solid #86efac;border-radius:4px;padding:1px 6px;font-size:12px">👍 ' + m.voted_by.length + '</span>';
     }
     if (m.mentions && m.mentions.length) {
       badge += ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">' +
@@ -2231,6 +2570,13 @@ ${main}
         api('/api/messages/' + id + '/' + action, 'POST', { sender: claimer }).then(function (r) {
           if (!r.ok) { alert('Không ' + (action === 'claim' ? 'nhận' : 'nhả') + ' được task: ' + (r.json.error || r.status)); return; }
           refreshRow(id); refreshWhatsNew();
+        });
+      } else if (action === 'vote') {
+        var voter = currentSender();
+        if (['muse-a', 'muse-b', 'muse-c', 'martin'].indexOf(voter) === -1) { alert('Chọn sender trong form rồi bấm lại.'); return; }
+        api('/api/messages/' + id + '/vote', 'POST', { voter: voter }).then(function (r) {
+          if (!r.ok) { alert('Không bình chọn được: ' + (r.json.error || r.status)); return; }
+          refreshRow(id);
         });
       } else if (action === 'copy') {
         var link = location.origin + location.pathname + '#msg-' + id;
@@ -2546,6 +2892,23 @@ ${wdRows}
     return res.end();
   }
 
+  // Bình chọn 1 tin từ form trên board (v1.10.0): POST /b/<token>/vote
+  // với id + voter=muse-a|muse-b|muse-c|martin, xong redirect về board.
+  // Bấm lại cùng voter là rút vote (toggle).
+  if (p === `/b/${BRIDGE_TOKEN}/vote` && req.method === 'POST') {
+    if (tokenExpired()) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }); return res.end(TOKEN_EXPIRED_MSG); }
+    if (rateLimited(req)) { res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('rate limited'); }
+    const body = new URLSearchParams(await readBody(req));
+    const id = Number(body.get('id'));
+    if (!Number.isInteger(id) || id <= 0) { res.writeHead(400); return res.end('id không hợp lệ'); }
+    const voter = String(body.get('voter') || '');
+    const r = toggleVote(id, voter);
+    if (!r.ok) { res.writeHead(r.code === 'not_found' ? 404 : 400); return res.end(r.error); }
+    console.log(`[mailbox] ${r.voted ? 'voted' : 'unvoted'} #${id} by ${voter} (👍 ${voteCount(r.message)})`);
+    res.writeHead(302, { location: `/b/${BRIDGE_TOKEN}` });
+    return res.end();
+  }
+
   // Form post from the mailbox page
   if (p === `/b/${BRIDGE_TOKEN}/msg` && req.method === 'POST') {
     if (tokenExpired()) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }); return res.end(TOKEN_EXPIRED_MSG); }
@@ -2556,7 +2919,7 @@ ${wdRows}
     if (!SENDERS.includes(sender) || !text) { res.writeHead(400); return res.end('sender hoặc text không hợp lệ'); }
     let task;
     try {
-      task = normalizeTask({ assignee: body.get('assignee'), status: body.get('status'), deadline: body.get('deadline') });
+      task = normalizeTask({ assignee: body.get('assignee'), status: body.get('status'), deadline: body.get('deadline'), priority: body.get('priority') });
     } catch (e) { res.writeHead(400); return res.end(e.message); }
     recordHeartbeat(sender);
     let msg;
@@ -2609,6 +2972,7 @@ ${wdRows}
     const assignee = url.searchParams.get('assignee') || '';
     const deadline = url.searchParams.get('deadline') || '';
     const locked = url.searchParams.get('locked') || '';
+    const priority = url.searchParams.get('priority') || '';
     const matchLocked = (t) => {
       if (!locked || locked === 'all') return true;
       if (locked === 'held') return Boolean(t.lockedBy) && !lockStale(t);
@@ -2619,9 +2983,41 @@ ${wdRows}
     const list = messages.filter((m) => m.task
       && (!status || m.task.status === status)
       && (!assignee || m.task.assignee === assignee)
+      && (!priority || taskPriority(m.task) === priority)
       && matchDeadlineFilter(m, deadline)
       && matchLocked(m.task));
     return json(res, 200, { ok: true, tasks: list });
+  }
+
+  // Hàng đợi ưu tiên + ideas (v1.10.0): GET /api/queue?token=... trả
+  // task đang mở xếp theo ưu tiên rồi vote + ideas có vote xếp theo vote
+  // (cùng dữ liệu với ?view=queue trên board). GET /api/ideas?token=
+  // &sort=votes|new liệt kê tin idea. GET /api/reviews?token= liệt kê
+  // các review PR tự động gần nhất (mới nhất trước).
+  if (p === '/api/queue' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, queue: buildQueue() });
+  }
+
+  if (p === '/api/ideas' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const sort = url.searchParams.get('sort') || 'votes';
+    if (sort !== 'votes' && sort !== 'new') {
+      return json(res, 400, { ok: false, error: 'sort must be votes|new' });
+    }
+    const limitRaw = Number(url.searchParams.get('limit') || 100);
+    const limit = Math.min(Math.max(limitRaw || 100, 1), 500);
+    return json(res, 200, { ok: true, ideas: listIdeas(sort).slice(0, limit) });
+  }
+
+  if (p === '/api/reviews' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const limitRaw = Number(url.searchParams.get('limit') || 20);
+    const limit = Math.min(Math.max(limitRaw || 20, 1), 100);
+    const reviews = messages
+      .filter((m) => m.type === 'status' && String(m.text || '').startsWith('[review'))
+      .slice(-limit).reverse();
+    return json(res, 200, { ok: true, reviews });
   }
 
   // Board status panel (v1.7.0): GET /api/board-status?token=... — cùng
@@ -2827,7 +3223,7 @@ ${wdRows}
     }
     let task;
     try {
-      task = normalizeTask(data.task ?? { assignee: data.assignee, status: data.status, deadline: data.deadline });
+      task = normalizeTask(data.task ?? { assignee: data.assignee, status: data.status, deadline: data.deadline, priority: data.priority });
     } catch (e) {
       return json(res, 400, { ok: false, error: e.message });
     }
@@ -2866,7 +3262,10 @@ ${wdRows}
       const t = checkTransition(msg.task || { status: 'todo' }, data.status);
       if (!t.ok) return json(res, 400, { ok: false, error: t.error });
     }
-    if (data.status !== undefined || data.assignee !== undefined || data.deadline !== undefined) {
+    if (data.priority !== undefined && !TASK_PRIORITIES.includes(data.priority)) {
+      return json(res, 400, { ok: false, error: 'priority must be high|medium|low' });
+    }
+    if (data.status !== undefined || data.assignee !== undefined || data.deadline !== undefined || data.priority !== undefined) {
       const lockErr = lockBlocks(msg.task, caller);
       if (lockErr) return json(res, 409, { ok: false, error: lockErr });
     }
@@ -2879,6 +3278,9 @@ ${wdRows}
     }
     if (data.status !== undefined) {
       next.status = data.status;
+    }
+    if (data.priority !== undefined) {
+      next.priority = data.priority;
     }
     if (data.deadline !== undefined) {
       if (data.deadline === null || data.deadline === '') {
@@ -2978,6 +3380,28 @@ ${wdRows}
     return json(res, 200, { ok: true, message: msg });
   }
 
+  // Bình chọn / rút vote (v1.10.0): POST /api/messages/:id/vote
+  // {"token","voter"} — voter là muse-a|muse-b|muse-c|martin. Bấm lại
+  // cùng voter là rút vote (toggle), trả voted=true|false + tin đã cập
+  // nhật (kèm voted_by). Tin không tồn tại trả 404; voter sai trả 400.
+  const votePatch = p.match(/^\/api\/messages\/(\d+)\/vote$/);
+  if (votePatch && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = toggleVote(Number(votePatch[1]), String(data.voter || ''));
+    if (!r.ok) {
+      const code = r.code === 'not_found' ? 404 : 400;
+      return json(res, code, { ok: false, error: r.error });
+    }
+    return json(res, 200, { ok: true, voted: r.voted, votes: voteCount(r.message), message: r.message });
+  }
+
   // Wrong / missing token on the mailbox path — don't leak whether it exists.
   if (p.startsWith('/b/')) { res.writeHead(404); return res.end('Not found'); }
   res.writeHead(404); return res.end('Not found');
@@ -3001,6 +3425,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Task lifecycle v1.9.0: claim → doing → review → done (POST /api/messages/:id/claim|release, khóa hết hạn sau ${TASK_LOCK_TIMEOUT_MINUTES} phút không hoạt động, nhắc task quá hạn / hạn hôm nay ${TASK_REMINDER_ENABLED ? 'BẬT' : 'TẮT'})`);
   console.log(`Duyệt nhanh PR trên Telegram v1.9.0: BẬT — nút ✅ Duyệt / 🔀 Merge dưới tin PR, lệnh /approve / /merge${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — nút Merge chỉ ghi quyết định + trả link merge tay)'}`);
+  console.log(`Review chéo PR tự động + hàng đợi ưu tiên v1.10.0: ${AUTO_REVIEW_ENABLED ? 'BẬT' : 'TẮT'} — webhook PR opened/synchronize → Muse khác tác giả đăng review lên thread (GET /api/reviews); task có priority high|medium|low, vote bằng POST /api/messages/:id/vote hoặc /vote <id> trên Telegram, xem ?view=queue (GET /api/queue, GET /api/ideas)`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
