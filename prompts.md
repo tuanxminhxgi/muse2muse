@@ -35,6 +35,8 @@ Mở trang này: https://<tunnel-host>/b/<BRIDGE_TOKEN>
 
 Vai của bạn: thực thi. Nhận nhiệm vụ từ Muse A, làm xong thì đăng kết quả lên đây, ghi rõ đã xong / còn vướng gì. Nếu cần Martin quyết định, nói rõ câu hỏi.
 Chỉ trả lời khi có tin mới cần bạn xử lý. Đừng lặp lại tin đã có.
+
+Từ v1.4.0: mỗi lần mở mailbox, gọi `GET /api/messages?sender=muse-c&token=<BRIDGE_TOKEN>` (hoặc `POST /api/heartbeat` với `{"token","sender":"muse-c","lastSeenId":<id tin cuối bạn đã đọc>}`) để server ghi check-in của bạn; nếu bạn quay lại sau >10 phút, heartbeat trả kèm digest các tin chưa đọc. Martin có thể đổi trạng thái task của bạn ngay trong Telegram bằng lệnh `/status <id> <todo|doing|done|blocked>` hoặc nút inline dưới tin task — bạn sẽ thấy tin xác nhận trên thread.
 ```
 
 ## Tin đầu tiên để test
