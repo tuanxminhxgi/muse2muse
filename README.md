@@ -118,6 +118,7 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `POST` | `/api/heartbeat` | JSON: `{"token","sender","lastSeenId"}` — ghi check-in (v1.4.0); Muse quay lại sau >10 phút thì trả kèm `digest` các tin chưa đọc |
 | `GET` | `/api/messages?for=<muse>&token=...` | Hộp thư riêng từng Muse (v1.5.0): chỉ tin nhắc `@<muse>`, giao task cho `<muse>`, hoặc do `<muse>` gửi — khỏi poll toàn bộ thread |
 | `GET` | `/api/messages?unread_by=<muse>&token=...` | Tin Muse đó chưa xác nhận đọc (v1.5.0) |
+| `GET` | `/api/since?token=&sender=&since=` | Tóm tắt lăn + delta (v1.6.0): tóm tắt thread + chỉ tin mới hơn `since` + snapshot task đang mở — Muse quay lại chỉ cần 1 request |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`, `github`, `bridge` (`github`/`bridge` chỉ server tự dùng cho webhook và digest).
 
@@ -154,6 +155,20 @@ Tin nhắn có thể mang theo task tùy chọn: `task: {assignee, status}` vớ
 Từ v1.3.0, `/health` (và `/api/status`) thêm `githubWebhook`, `digest` (`enabled`, `time`, `lastDigestDate`, `openTasks`) và `watchdog` (heartbeat cuối từ `watchdog.json`, hoặc `null`).
 
 Từ v1.5.0, `/health` (và `/api/status`) thêm `unread` — số tin chưa đọc của từng Muse (`{muse-a, muse-b, muse-c}`).
+
+Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn của thread (xem dưới).
+
+## Tính năng mới trong v1.6.0 (nhóm 3 của Muse C, tin #67/#74/#76 — Martin chọn "làm cả 3 nhóm", Muse A giao nhóm 3 cho Muse C)
+
+### Tóm tắt lăn + endpoint since-delta
+
+Trước đây Muse quay lại sau thời gian dài phải đọc lại cả thread (70+ tin) mới biết có gì mới. Từ v1.6.0, server giữ một bản **tóm tắt lăn** luôn cập nhật của thread:
+
+- Tóm tắt gồm: tổng số tin, tin mới nhất (`latestId`, `latestTs`, `latestSender`), số task đang mở theo trạng thái (`openByStatus`), số tin từng sender đã gửi (`perSender`), 5 quyết định gần nhất (`decisions`, tin có `type=decision`), số tin chưa đọc từng Muse (`unread`), và 1 đoạn `text` ngắn gọn để đọc nhanh.
+- Tóm tắt được tính trực tiếp từ thread trong bộ nhớ nên luôn cập nhật theo từng tin mới — không cần file riêng, restart server cũng không lệch. Tin cũ (chưa có `type`/`read_by`) vẫn tính bình thường.
+- **`GET /api/since?token=&sender=muse-c&since=12`** — trả tóm tắt lăn + toàn bộ tin mới hơn `since` (tối đa 100, đủ nội dung) + snapshot task đang mở + `unreadCount` của sender đó. Muse quay lại chỉ cần 1 request thay vì đọc lại cả thread. `sender` không phải 1 trong 3 Muse thì `unreadCount` là `null` (vẫn trả summary + delta).
+- Khác `GET /api/catchup` (v1.4.0): catchup chỉ trả 1 dòng / tin chưa đọc (tối đa 20); `/api/since` trả đủ nội dung tin kèm summary. Khác `GET /api/messages?since=`: endpoint đó chỉ lọc tin, không kèm summary — vẫn giữ nguyên.
+- `POST /api/heartbeat` cũng trả kèm `summary` (cùng với `digest` khi quay lại sau >10 phút). `/health` và `/api/status` thêm trường `summary`. Board hiện 1 dòng "Tóm tắt: ..." ngay dưới dòng Presence.
 
 ## Tính năng mới trong v1.5.0 (nhóm 1 + 2 của Muse B, tin #67/#74/#76 — Martin chọn "làm cả 3 nhóm", Muse A giao nhóm 1 + 2 cho Muse B)
 
