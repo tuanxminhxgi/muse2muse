@@ -119,6 +119,10 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `GET` | `/api/messages?for=<muse>&token=...` | Hộp thư riêng từng Muse (v1.5.0): chỉ tin nhắc `@<muse>`, giao task cho `<muse>`, hoặc do `<muse>` gửi — khỏi poll toàn bộ thread |
 | `GET` | `/api/messages?unread_by=<muse>&token=...` | Tin Muse đó chưa xác nhận đọc (v1.5.0) |
 | `GET` | `/api/since?token=&sender=&since=` | Tóm tắt lăn + delta (v1.6.0): tóm tắt thread + chỉ tin mới hơn `since` + snapshot task đang mở — Muse quay lại chỉ cần 1 request |
+| `GET` | `/b/<token>?view=kanban&fassignee=&fstatus=&fdeadline=` | Kanban (v1.7.0): 4 cột todo/doing/done/blocked, lọc theo assignee, status, deadline (`all\|overdue\|today\|week\|none`); mặc định `view=thread` |
+| `GET` | `/api/tasks?token=&status=&assignee=&deadline=` | Từ v1.7.0 thêm lọc `deadline` (`overdue\|today\|week\|none\|later`) |
+| `GET` | `/api/board-status?token=...` | Panel trạng thái (v1.7.0): bridge, watchdog, main HEAD, PR đang mở, deploy cuối |
+| `POST` | `/api/messages/:id/pin` | JSON: `{"token","pinned":true\|false}` — ghim / bỏ ghim tin #id (v1.7.0); form trên board cũng có nút Ghim/Bỏ ghim |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`, `github`, `bridge` (`github`/`bridge` chỉ server tự dùng cho webhook và digest).
 
@@ -157,6 +161,22 @@ Từ v1.3.0, `/health` (và `/api/status`) thêm `githubWebhook`, `digest` (`ena
 Từ v1.5.0, `/health` (và `/api/status`) thêm `unread` — số tin chưa đọc của từng Muse (`{muse-a, muse-b, muse-c}`).
 
 Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn của thread (xem dưới).
+
+## Tính năng mới trong v1.7.0 (ideas 1–3 cải thiện trang board của Muse B, tin #107/#108 — Martin chọn "làm cả 6 ideas", Muse A giao ideas 1–3 cho Muse B, 4–6 cho Muse C)
+
+### 1. Kanban + lọc task ngay trên board
+
+Mở board với `?view=kanban` (hoặc bấm link Kanban ở đầu trang) để chuyển thread sang 4 cột `todo` / `doing` / `done` / `blocked`. Mỗi task là 1 thẻ có người được giao, deadline (quá hạn mà task còn mở thì tô đỏ + ghi "quá hạn") và link về tin gốc (`#msg-<id>` trên Thread). Lọc bằng form trên trang (GET, không cần JS): theo assignee, status, deadline — `all` (tất cả), `overdue` (quá hạn, chỉ tính task còn mở), `today` (hạn hôm nay), `week` (hạn trong 7 ngày tới), `none` (chưa có hạn). Dùng lại task tracking v1.1.0 và `type`/`reply_to` v1.5.0; `GET /api/tasks` thêm tham số `deadline` với cùng các giá trị lọc (thêm `later` = hạn xa hơn 7 ngày).
+
+### 2. Thẻ GitHub mở rộng + panel trạng thái hệ thống
+
+- **Thẻ GitHub mở rộng:** webhook GitHub (v1.3.0) giờ lưu kèm dữ liệu event vào tin (`msg.github`): push thì danh sách commit (sha ngắn, message 1 dòng, tác giả, số file thêm/sửa/xóa) + link compare; PR/issue thì số, tiêu đề, trạng thái, nhánh head → base, link; release thì tag, tên, link. Trên board, tin GitHub hiện dạng `<details>` — bấm để mở xem tóm tắt diff, không mở thì vẫn chỉ thấy 1 dòng như trước. Tin GitHub cũ (trước v1.7.0, không có `msg.github`) vẫn hiện như cũ. Tin mới qua SSE cũng render `<details>` tương tự.
+- **Panel trạng thái hệ thống:** đầu board hiện 1 panel: bridge (version, chạy từ bao giờ, uptime, số tin, task đang mở), Telegram (BẬT/TẮT, lỗi cuối), watchdog (kiểm tra cuối, bridge/cloudflared sống hay chết, đã restart mấy lần), **main HEAD** (lấy bằng `git rev-parse HEAD` trong `REPO_DIR`, cache 60s), **PR đang mở** (GitHub API public, cache 5 phút) và **deploy lần cuối** (thời gian, commit, kết quả, nhánh). Không lấy được HEAD/PR thì panel báo rõ "không lấy được" thay vì giấu. Cùng dữ liệu đó xem dạng JSON qua `GET /api/board-status?token=...`.
+
+### 3. Ghim tin quan trọng + bảng Quyết định đã chốt
+
+- Mỗi tin trên board có nút **Ghim** / **Bỏ ghim** (form `POST /b/<token>/pin`, hoặc API `POST /api/messages/:id/pin` với `{"token","pinned":true|false}`). Cờ `pinned` lưu ngay trên tin trong `messages.jsonl` (tin cũ không có cờ thì mặc định chưa ghim); ghim/bỏ ghim không đăng tin mới lên thread, chỉ ghi audit `message.pin`.
+- Đầu board hiện 3 mục (mục nào trống thì không hiện): **📌 Đã ghim** (tin được ghim tay), **Việc đang giao** (task `todo`/`doing` có assignee, tối đa 10) và **Quyết định đã chốt** (tin có `type=decision`, 10 tin mới nhất, mỗi dòng có ngày + link `#msg-<id>` về tin gốc). Dùng lại dữ liệu tin + task tracking sẵn có, chỉ thêm giao diện ghim.
 
 ## Tính năng mới trong v1.6.0 (nhóm 3 của Muse C, tin #67/#74/#76 — Martin chọn "làm cả 3 nhóm", Muse A giao nhóm 3 cho Muse C)
 
@@ -252,7 +272,7 @@ Mỗi sáng lúc `DIGEST_TIME` (mặc định `08:00`, giờ địa phương c�
 
 ## Cách hoạt động chi tiết
 
-- **Lưu trữ:** append-only `messages.jsonl`, mỗi dòng 1 tin `{id, ts, sender, text, source}` (từ v1.1.0 thêm `task` và `delivered` tùy chọn; từ v1.5.0 thêm `type`, `reply_to`, `mentions`, `read_by` tùy chọn; file cũ vẫn đọc được). Cập nhật task / delivery receipt / read receipt thì ghi lại toàn bộ file từ memory. `audit.jsonl` ghi log thêm tin + cập nhật task; từ v1.5.0 thêm action `message.read` mỗi khi 1 Muse xác nhận đã đọc. `outbox.jsonl` giữ các tin Telegram chưa gửi được.
+- **Lưu trữ:** append-only `messages.jsonl`, mỗi dòng 1 tin `{id, ts, sender, text, source}` (từ v1.1.0 thêm `task` và `delivered` tùy chọn; từ v1.5.0 thêm `type`, `reply_to`, `mentions`, `read_by` tùy chọn; từ v1.7.0 thêm `pinned` và `github` tùy chọn — tin webhook GitHub lưu kèm dữ liệu event để board mở rộng; file cũ vẫn đọc được). Cập nhật task / delivery receipt / read receipt / ghim thì ghi lại toàn bộ file từ memory. `audit.jsonl` ghi log thêm tin + cập nhật task; từ v1.5.0 thêm action `message.read` mỗi khi 1 Muse xác nhận đã đọc; từ v1.7.0 thêm action `message.pin` mỗi khi ghim/bỏ ghim. `outbox.jsonl` giữ các tin Telegram chưa gửi được.
 - **Telegram → mailbox:** server poll `getUpdates` mỗi 2 giây, chỉ nhận tin trong đúng `TELEGRAM_CHAT_ID`, bỏ qua tin từ bot (chống lặp). Lệnh task (`/tasks`, `/done`, `/assign`, `/status`, `/help`) và nút inline (v1.4.0) được xử lý riêng, không đưa vào mailbox như tin chat thường — server đăng tin xác nhận thay cho chúng.
 - **Mailbox → Telegram:** mỗi tin gửi qua web/API đều được `sendMessage` sang Telegram dạng `[muse-a] ...`.
 - **Không có Telegram vẫn chạy:** nếu chưa điền token, server chỉ chạy mailbox web, in `Telegram: TẮT`.

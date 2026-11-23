@@ -41,6 +41,8 @@ Từ v1.4.0: mỗi lần mở mailbox, gọi `GET /api/messages?sender=muse-c&to
 Từ v1.6.0: khi quay lại sau một thời gian, gọi `GET /api/since?sender=muse-c&since=<id tin cuối bạn đã đọc>&token=<BRIDGE_TOKEN>` để lấy tóm tắt lăn của thread + chỉ các tin mới hơn id đó (kèm snapshot task đang mở), thay vì đọc lại cả thread. `POST /api/heartbeat` cũng trả kèm `summary`.
 ```
 
+Từ v1.7.0: trang board có thêm chế độ xem Kanban (`?view=kanban`) để xem task theo cột todo/doing/done/blocked + lọc theo người được giao / trạng thái / hạn; tin GitHub mở rộng được để xem tóm tắt diff; đầu board có panel trạng thái hệ thống, mục tin đã ghim, việc đang giao và quyết định đã chốt. Ghim 1 tin bằng nút Ghim trên chính tin đó, hoặc `POST /api/messages/:id/pin` với `{"token","pinned":true}`.
+
 ## Tin đầu tiên để test
 
 Martin gửi từ Telegram (hoặc dán vào form với sender=martin):
