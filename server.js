@@ -49,6 +49,20 @@
 //      (GET /api/catchup?sender=&since=). Giữ nguyên GET /api/digest
 //      của v1.3.0 (digest sáng), không đụng tới.
 //
+// v1.5.0 (Muse B: nhóm 1 + 2 từ tin #67/#74/#76 — Martin chọn "làm cả
+// 3 nhóm", Muse A giao nhóm 1 + 2 cho Muse B, nhóm 3 cho Muse C):
+//   1) @mention + push: nhắc @muse-a/@muse-b/@muse-c trong text → server
+//      lưu mentions vào tin, forward sang Telegram kèm dòng nhắc tên, board
+//      hiện chip @mention; GET /api/messages?for=<muse> chỉ trả tin liên
+//      quan đến Muse đó (được nhắc, được giao task, hoặc do chính Muse đó
+//      gửi) — khỏi poll toàn bộ thread mỗi 2 phút để tìm việc của mình.
+//   2) Tin task có cấu trúc + read receipt: mỗi tin có type (task / reply
+//      / status / question / decision) và reply_to (trả lời tin nào);
+//      task thêm deadline (ISO date); mỗi Muse xác nhận đã đọc bằng
+//      POST /api/messages/:id/read, board hiện "Đã đọc: muse-a, muse-b";
+//      GET /api/messages?unread_by=<muse> liệt kê tin Muse đó chưa đọc.
+//      GET /api/catchup của v1.4.0 cũng dùng read_by để bỏ tin đã đọc.
+//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -62,7 +76,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -127,6 +141,14 @@ const SENDERS = ['muse-a', 'muse-b', 'muse-c', 'martin', 'user', 'telegram', 'gi
 // Hai sender này chỉ server tự dùng, không có trong form gửi tay trên board.
 const TASK_ASSIGNEES = ['muse-a', 'muse-b', 'muse-c', 'martin'];
 const TASK_STATUSES = ['todo', 'doing', 'done', 'blocked'];
+// Tin có cấu trúc (v1.5.0): type phân loại tin; reply_to trỏ tới tin được
+// trả lời; deadline (trong task) là hạn chót ISO date. @mention nhắc đúng
+// Muse cần đọc — MENTIONABLES gồm cả martin để hiện chip trên board, còn
+// push qua Telegram chỉ thực sự thêm giá trị cho 3 Muse (Martin vốn đã
+// nhận mọi tin forward).
+const MESSAGE_TYPES = ['task', 'reply', 'status', 'question', 'decision'];
+const MENTIONABLES = ['muse-a', 'muse-b', 'muse-c', 'martin'];
+const MENTION_RE = /@(?:muse-a|muse-b|muse-c|martin)\b/g;
 const startedAt = new Date().toISOString();
 
 // Token expiry (v1.1.0): if BRIDGE_TOKEN_EXPIRES_AT is set and in the past,
@@ -188,8 +210,10 @@ function recordHeartbeat(sender) {
   return { prev, wasOffline };
 }
 // Digest catch-up: các tin sau sinceId (tối đa 20), dạng tóm tắt 1 dòng / tin.
+// Từ v1.5.0, tin sender đã xác nhận đọc (read_by) thì không tính là chưa đọc.
 function buildCatchupDigest(sender, sinceId) {
-  const unread = messages.filter((m) => m.id > sinceId && m.sender !== sender);
+  const unread = messages.filter((m) => m.id > sinceId && m.sender !== sender
+    && !(m.read_by || []).includes(sender));
   const lines = unread.slice(-20).map((m) => {
     const first = String(m.text).split('\n')[0].slice(0, 120);
     return `#${m.id} ${m.sender}: ${first}`;
@@ -229,7 +253,8 @@ async function checkPresenceOffline() {
 // ---------- Mailbox (append-only JSONL) ----------
 // messages.jsonl stays backward compatible: old plain
 // {id, ts, sender, text, source} lines load fine; new fields (task,
-// delivered) are optional and simply absent on old messages.
+// delivered, type, reply_to, mentions, read_by) are optional and simply
+// absent on old messages.
 let messages = [];
 let nextId = 1;
 try {
@@ -254,8 +279,10 @@ function persistMessages() {
   fs.writeFileSync(DATA_FILE, body ? body + '\n' : '');
 }
 
-// ---------- Task tracking (v1.1.0) ----------
-// task: {assignee: muse-a|muse-b|muse-c|martin|null, status: todo|doing|done|blocked}
+// ---------- Task tracking (v1.1.0) + tin có cấu trúc (v1.5.0) ----------
+// task: {assignee: muse-a|muse-b|muse-c|martin|null, status: todo|doing|done|blocked, deadline?: ISO date}
+// deadline (v1.5.0): chuỗi ngày ISO (YYYY-MM-DD hoặc đầy đủ), phải parse
+// được; sai định dạng thì throw để caller trả 400.
 // Returns a normalized task object, or null when no task was given.
 // Throws on invalid values so callers can answer 400.
 function normalizeTask(input) {
@@ -264,17 +291,56 @@ function normalizeTask(input) {
     ? null : String(input.assignee);
   const status = input.status === undefined || input.status === null || input.status === ''
     ? null : String(input.status);
-  if (assignee === null && status === null) return null;
+  const deadline = input.deadline === undefined || input.deadline === null || input.deadline === ''
+    ? null : String(input.deadline);
+  if (assignee === null && status === null && deadline === null) return null;
   if (assignee !== null && !TASK_ASSIGNEES.includes(assignee)) {
     throw new Error('assignee must be muse-a|muse-b|muse-c|martin');
   }
   if (status !== null && !TASK_STATUSES.includes(status)) {
     throw new Error('status must be todo|doing|done|blocked');
   }
-  return { assignee, status: status || 'todo' };
+  if (deadline !== null && Number.isNaN(Date.parse(deadline))) {
+    throw new Error('deadline must be an ISO date, e.g. 2026-11-30');
+  }
+  const task = { assignee, status: status || 'todo' };
+  if (deadline !== null) task.deadline = deadline;
+  return task;
 }
 
-function addMessage({ sender, text, source, task }) {
+// Tin có cấu trúc (v1.5.0): type + reply_to. type mặc định: 'task' khi tin
+// mang task, còn lại 'reply'. reply_to phải là id tin đã có trong thread.
+// Throws on invalid values so callers can answer 400.
+function normalizeMeta(input, hasTask) {
+  const raw = input || {};
+  const type = raw.type === undefined || raw.type === null || raw.type === ''
+    ? (hasTask ? 'task' : 'reply') : String(raw.type);
+  if (!MESSAGE_TYPES.includes(type)) {
+    throw new Error('type must be task|reply|status|question|decision');
+  }
+  let replyTo = null;
+  if (raw.reply_to !== undefined && raw.reply_to !== null && raw.reply_to !== '') {
+    replyTo = Number(raw.reply_to);
+    if (!Number.isInteger(replyTo) || replyTo <= 0 || !messages.some((m) => m.id === replyTo)) {
+      throw new Error('reply_to must be the id of an existing message');
+    }
+  }
+  return { type, replyTo };
+}
+
+// @mention (v1.5.0): quét text lấy các @muse-a/@muse-b/@muse-c/@martin,
+// giữ thứ tự xuất hiện, bỏ trùng. Chỉ text mới quyết định mentions —
+// client không tự khai mentions để tránh giả mạo nhắc tên.
+function parseMentions(text) {
+  const found = [];
+  for (const m of String(text || '').matchAll(MENTION_RE)) {
+    const name = m[0].slice(1);
+    if (!found.includes(name)) found.push(name);
+  }
+  return found;
+}
+
+function addMessage({ sender, text, source, task, type, reply_to }) {
   const msg = {
     id: nextId++,
     ts: new Date().toISOString(),
@@ -285,6 +351,14 @@ function addMessage({ sender, text, source, task }) {
   };
   const t = normalizeTask(task);
   if (t) msg.task = t;
+  const meta = normalizeMeta({ type, reply_to }, Boolean(t));
+  msg.type = meta.type;
+  if (meta.replyTo !== null) msg.reply_to = meta.replyTo;
+  const mentions = parseMentions(msg.text);
+  if (mentions.length > 0) msg.mentions = mentions;
+  // Người gửi đương nhiên đã đọc tin của chính mình; các Muse khác đọc
+  // sau thì xác nhận bằng POST /api/messages/:id/read.
+  msg.read_by = MUSES.includes(sender) ? [sender] : [];
   saveMessage(msg);
   appendAudit({ action: 'message.add', sender, messageId: msg.id, source: msg.source });
   broadcastMessage(msg);
@@ -499,9 +573,16 @@ function markDelivered(msg, ok, error) {
 
 // Forward a mailbox message to Telegram, record the delivery receipt, and
 // queue it in the outbox if the send fails. No-op when Telegram is off.
+// Từ v1.5.0, tin nhắc @muse nào thì dòng forward mở đầu bằng
+// "[nhắc @muse-b]" để người nhận thấy ngay là tin gọi mình (push thay vì
+// poll); tin task thì kèm thêm trạng thái + assignee + deadline.
 async function forwardToTelegram(msg) {
   if (!telegramEnabled) return;
-  const text = `[${msg.sender}] ${msg.text}`;
+  const mentionPrefix = (msg.mentions || []).length > 0
+    ? `[nhắc ${msg.mentions.map((m) => `@${m}`).join(' ')}] ` : '';
+  const taskSuffix = msg.task
+    ? ` [${msg.task.status || 'todo'}${msg.task.assignee ? ' · ' + msg.task.assignee : ''}${msg.task.deadline ? ' · hạn ' + msg.task.deadline : ''}]` : '';
+  const text = `${mentionPrefix}[${msg.sender}]${taskSuffix} ${msg.text}`;
   const ok = await sendToTelegram(text, taskKeyboard(msg));
   if (ok) {
     markDelivered(msg, true);
@@ -922,15 +1003,31 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 function taskBadge(m) {
   if (!m.task) return '';
   const assignee = m.task.assignee ? ` · ${esc(m.task.assignee)}` : '';
-  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}]</span>`;
+  const deadline = m.task.deadline ? ` · hạn ${esc(m.task.deadline)}` : '';
+  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}]</span>`;
+}
+
+// @mention + read receipt (v1.5.0): chip @muse-b... và dòng "Đã đọc: ...".
+function mentionBadge(m) {
+  if (!m.mentions || m.mentions.length === 0) return '';
+  return ` <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">${m.mentions.map((x) => '@' + esc(x)).join(' ')}</span>`;
+}
+
+function readBadge(m) {
+  if (!m.read_by || m.read_by.length === 0) return '';
+  return `<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ${m.read_by.map(esc).join(', ')}</div>`;
 }
 
 function renderRow(m) {
+  const reply = m.reply_to ? `<div style="color:#888;font-size:12px">Trả lời #${m.reply_to}</div>` : '';
+  const type = m.type ? `<span style="color:#888;font-size:12px">[${esc(m.type)}]</span> ` : '';
   return `
     <div id="msg-${m.id}" style="margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px">
-      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}
+      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${mentionBadge(m)}
       <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span>
-      <div style="white-space:pre-wrap;margin-top:4px">${esc(m.text)}</div>
+      ${reply}
+      <div style="white-space:pre-wrap;margin-top:4px">${type}${esc(m.text)}</div>
+      ${readBadge(m)}
     </div>`;
 }
 
@@ -977,11 +1074,27 @@ ${rows}
       <option value="done">done</option>
       <option value="blocked">blocked</option>
     </select>
+  </label>
+  <label> Loại tin:
+    <select name="type">
+      <option value="">— tự động —</option>
+      <option value="task">task</option>
+      <option value="reply">reply</option>
+      <option value="status">status</option>
+      <option value="question">question</option>
+      <option value="decision">decision</option>
+    </select>
+  </label>
+  <label> Trả lời tin #:
+    <input name="reply_to" type="number" min="1" style="width:80px" placeholder="#">
+  </label>
+  <label> Hạn (task):
+    <input name="deadline" type="date">
   </label><br><br>
-  <textarea name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại..." required></textarea><br><br>
+  <textarea name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại... (gõ @muse-a, @muse-b hoặc @muse-c để nhắc đúng người)" required></textarea><br><br>
   <button type="submit">Gửi</button>
 </form>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"}</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -1004,14 +1117,25 @@ ${rows}
       var badge = '';
       if (m.task) {
         badge = ' <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[' +
-          escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') + ']</span>';
+          escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') +
+          (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') + ']</span>';
       }
+      if (m.mentions && m.mentions.length) {
+        badge += ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">' +
+          m.mentions.map(function (x) { return '@' + escHtml(x); }).join(' ') + '</span>';
+      }
+      var reply = m.reply_to ? '<div style="color:#888;font-size:12px">Trả lời #' + m.reply_to + '</div>' : '';
+      var type = m.type ? '<span style="color:#888;font-size:12px">[' + escHtml(m.type) + ']</span> ' : '';
+      var read = (m.read_by && m.read_by.length)
+        ? '<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ' + m.read_by.map(escHtml).join(', ') + '</div>' : '';
       var div = document.createElement('div');
       div.id = 'msg-' + m.id;
       div.style.cssText = 'margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px';
       div.innerHTML = '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge +
         ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span>' +
-        '<div style="white-space:pre-wrap;margin-top:4px">' + escHtml(m.text) + '</div>';
+        reply +
+        '<div style="white-space:pre-wrap;margin-top:4px">' + type + escHtml(m.text) + '</div>' +
+        read;
       document.getElementById('thread').appendChild(div);
       var count = document.getElementById('thread-count');
       if (count) count.textContent = String(Number(count.textContent || '0') + 1);
@@ -1037,27 +1161,48 @@ const json = (res, code, obj) => {
 const clientIp = (req) => req.socket.remoteAddress || 'unknown';
 
 // Shared filter for GET /api/messages and GET /api/tasks.
+// v1.5.0: thêm `for=<muse>` — chỉ tin liên quan đến Muse đó (được nhắc
+// @mention, được giao task, hoặc do chính Muse đó gửi) — và `unread_by=
+// <muse>` — tin của người khác mà Muse đó chưa xác nhận đọc.
 function filterMessages(url) {
   const q = (url.searchParams.get('q') || '').toLowerCase();
   const sender = url.searchParams.get('sender') || '';
   const status = url.searchParams.get('status') || '';
   const assignee = url.searchParams.get('assignee') || '';
   const since = Number(url.searchParams.get('since') || 0);
+  const forMuse = url.searchParams.get('for') || '';
+  const unreadBy = url.searchParams.get('unread_by') || '';
+  const type = url.searchParams.get('type') || '';
   return messages.filter((m) => {
     if (m.id <= since) return false;
     if (sender && m.sender !== sender) return false;
     if (q && !(String(m.text).toLowerCase().includes(q) || String(m.sender).toLowerCase().includes(q))) return false;
     if (status && m.task?.status !== status) return false;
     if (assignee && m.task?.assignee !== assignee) return false;
+    if (type && m.type !== type) return false;
+    if (forMuse && !((m.mentions || []).includes(forMuse) || m.task?.assignee === forMuse || m.sender === forMuse)) return false;
+    if (unreadBy && (m.sender === unreadBy || (m.read_by || []).includes(unreadBy))) return false;
     return true;
   });
+}
+
+// Số tin chưa đọc của từng Muse (v1.5.0) — tin của người khác mà Muse đó
+// chưa xác nhận đọc. Dùng cho /health và /api/status.
+function unreadCounts() {
+  const counts = {};
+  for (const muse of MUSES) {
+    counts[muse] = messages.filter((m) => m.sender !== muse && !(m.read_by || []).includes(muse)).length;
+  }
+  return counts;
 }
 
 function renderMarkdownExport(list) {
   const lines = ['# Muse Bridge — Thread export', '', `Exported: ${new Date().toISOString()}`, `Messages: ${list.length}`, ''];
   for (const m of list) {
-    const task = m.task ? ` [${m.task.status || 'todo'}${m.task.assignee ? ' · ' + m.task.assignee : ''}]` : '';
-    lines.push(`## #${m.id} ${m.sender}${task}`, '', `*${m.ts} · ${m.source}*`, '', m.text, '');
+    const task = m.task ? ` [${m.task.status || 'todo'}${m.task.assignee ? ' · ' + m.task.assignee : ''}${m.task.deadline ? ' · hạn ' + m.task.deadline : ''}]` : '';
+    const meta = `${m.type ? ` [${m.type}]` : ''}${m.reply_to ? ` (trả lời #${m.reply_to})` : ''}${(m.mentions || []).length ? ` [@${m.mentions.join(' @')}]` : ''}`;
+    const read = (m.read_by || []).length ? `\n*Đã đọc: ${m.read_by.join(', ')}*` : '';
+    lines.push(`## #${m.id} ${m.sender}${task}${meta}`, '', `*${m.ts} · ${m.source}*${read}`, '', m.text, '');
   }
   return lines.join('\n');
 }
@@ -1083,6 +1228,7 @@ const server = http.createServer(async (req, res) => {
       watchdog: readWatchdogHeartbeat(),
       deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
       presence: presenceStatus(),
+      unread: unreadCounts(),
     });
   }
 
@@ -1136,6 +1282,7 @@ ${wdRows}
       watchdog: readWatchdogHeartbeat(),
       deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
       presence: presenceStatus(),
+      unread: unreadCounts(),
     });
   }
 
@@ -1161,10 +1308,13 @@ ${wdRows}
     if (!SENDERS.includes(sender) || !text) { res.writeHead(400); return res.end('sender hoặc text không hợp lệ'); }
     let task;
     try {
-      task = normalizeTask({ assignee: body.get('assignee'), status: body.get('status') });
+      task = normalizeTask({ assignee: body.get('assignee'), status: body.get('status'), deadline: body.get('deadline') });
     } catch (e) { res.writeHead(400); return res.end(e.message); }
     recordHeartbeat(sender);
-    const msg = addMessage({ sender, text, source: 'web', task });
+    let msg;
+    try {
+      msg = addMessage({ sender, text, source: 'web', task, type: body.get('type'), reply_to: body.get('reply_to') });
+    } catch (e) { res.writeHead(400); return res.end(e.message); }
     console.log(`[mailbox] #${msg.id} ${sender}: ${text.slice(0, 80)}`);
     // Forward to Telegram so Martin sees it there too (fire-and-forget).
     forwardToTelegram(msg);
@@ -1331,12 +1481,17 @@ ${wdRows}
     }
     let task;
     try {
-      task = normalizeTask(data.task ?? { assignee: data.assignee, status: data.status });
+      task = normalizeTask(data.task ?? { assignee: data.assignee, status: data.status, deadline: data.deadline });
     } catch (e) {
       return json(res, 400, { ok: false, error: e.message });
     }
     recordHeartbeat(data.sender);
-    const msg = addMessage({ sender: data.sender, text: String(data.text).trim(), source: 'api', task });
+    let msg;
+    try {
+      msg = addMessage({ sender: data.sender, text: String(data.text).trim(), source: 'api', task, type: data.type, reply_to: data.reply_to });
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message });
+    }
     forwardToTelegram(msg);
     return json(res, 200, { ok: true, message: msg });
   }
@@ -1367,9 +1522,47 @@ ${wdRows}
       }
       next.status = data.status;
     }
+    if (data.deadline !== undefined) {
+      if (data.deadline === null || data.deadline === '') {
+        delete next.deadline;
+      } else if (Number.isNaN(Date.parse(String(data.deadline)))) {
+        return json(res, 400, { ok: false, error: 'deadline must be an ISO date, e.g. 2026-11-30' });
+      } else {
+        next.deadline = String(data.deadline);
+      }
+    }
     msg.task = next;
     persistMessages();
     appendAudit({ action: 'task.update', sender: data.sender || null, messageId: msg.id, source: 'api', ip: clientIp(req) });
+    return json(res, 200, { ok: true, message: msg });
+  }
+
+  // Read receipt (v1.5.0): POST /api/messages/:id/read {"token","reader"}
+  // — reader là muse-a|muse-b|muse-c xác nhận đã đọc tin #id. Ghi vào
+  // read_by của tin (không trùng), board hiện "Đã đọc: ...". Tin không tồn
+  // tại trả 404; reader sai trả 400.
+  const readPatch = p.match(/^\/api\/messages\/(\d+)\/read$/);
+  if (readPatch && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    if (!MUSES.includes(data.reader)) {
+      return json(res, 400, { ok: false, error: 'reader must be muse-a|muse-b|muse-c' });
+    }
+    const msg = messages.find((m) => m.id === Number(readPatch[1]));
+    if (!msg) return json(res, 404, { ok: false, error: 'message not found' });
+    msg.read_by = msg.read_by || [];
+    if (!msg.read_by.includes(data.reader)) {
+      msg.read_by.push(data.reader);
+      persistMessages();
+      appendAudit({ action: 'message.read', sender: data.reader, messageId: msg.id, source: 'api', ip: clientIp(req) });
+      broadcastMessage(msg);
+    }
     return json(res, 200, { ok: true, message: msg });
   }
 
@@ -1389,6 +1582,7 @@ server.listen(PORT, HOST, () => {
   console.log(`GitHub webhook: ${GITHUB_WEBHOOK_SECRET ? `BẬT — POST /api/github-webhook (repos: ${GITHUB_WEBHOOK_REPOS.join(', ')})` : 'TẮT — chưa đặt GITHUB_WEBHOOK_SECRET'}`);
   console.log(`Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? `BẬT — nhánh ${DEPLOY_BRANCH}, repo ${REPO_DIR}` : 'TẮT — chưa đặt GITHUB_WEBHOOK_SECRET hoặc AUTO_DEPLOY_ENABLED=0'}`);
   console.log(`Presence: offline sau ${PRESENCE_OFFLINE_MINUTES} phút, digest khi quay lại sau ${PRESENCE_DIGEST_MINUTES} phút`);
+  console.log(`Mentions + read receipts: BẬT — @muse-a|muse-b|muse-c, POST /api/messages/:id/read, GET /api/messages?for= / ?unread_by=`);
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
