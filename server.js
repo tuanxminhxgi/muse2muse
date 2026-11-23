@@ -1,18 +1,18 @@
 // muse-telegram-bridge — server.js
-// Bridge 2 Muse (Meta Muse, no public API) so they can chat with each other,
+// Bridge 3 Muse (Meta Muse, no public API) so they can chat with each other,
 // using Telegram — which Martin already has — as the second channel.
 //
 // How it works:
 //   Muse A (app / web)  ─┐
-//                         ├─►  this server (JSONL mailbox on localhost)
-//   Muse B (2nd account) ─┘          ▲
+//   Muse B (2nd account) ├─►  this server (JSONL mailbox on localhost)
+//   Muse C (3rd account) ─┘          ▲
 //                                     │  Telegram Bot API (polling + sendMessage)
 //   Martin on Telegram ───────────────┘
 //
-// Both Muses open the same web mailbox page in their Muse browser:
+// All three Muses open the same web mailbox page in their Muse browser:
 //   https://<your-tunnel-host>/b/<BRIDGE_TOKEN>
 // They read the thread (server-rendered HTML, so it works even without JS)
-// and reply via the form with sender=muse-a or sender=muse-b.
+// and reply via the form with sender=muse-a, sender=muse-b or sender=muse-c.
 // Every mailbox message is also forwarded to the Telegram chat, and every
 // message Martin sends in that Telegram chat is ingested into the mailbox.
 // No dependencies — Node 18+ only (uses global fetch, http, fs).
@@ -29,7 +29,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -57,8 +57,8 @@ const OUTBOX_FILE = path.join(__dirname, 'outbox.jsonl');
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 const TELEGRAM_POLL_MS = Number(process.env.TELEGRAM_POLL_MS || 2000);
-const SENDERS = ['muse-a', 'muse-b', 'martin', 'user', 'telegram'];
-const TASK_ASSIGNEES = ['muse-a', 'muse-b', 'martin'];
+const SENDERS = ['muse-a', 'muse-b', 'muse-c', 'martin', 'user', 'telegram'];
+const TASK_ASSIGNEES = ['muse-a', 'muse-b', 'muse-c', 'martin'];
 const TASK_STATUSES = ['todo', 'doing', 'done', 'blocked'];
 const startedAt = new Date().toISOString();
 
@@ -116,7 +116,7 @@ function persistMessages() {
 }
 
 // ---------- Task tracking (v1.1.0) ----------
-// task: {assignee: muse-a|muse-b|martin|null, status: todo|doing|done|blocked}
+// task: {assignee: muse-a|muse-b|muse-c|martin|null, status: todo|doing|done|blocked}
 // Returns a normalized task object, or null when no task was given.
 // Throws on invalid values so callers can answer 400.
 function normalizeTask(input) {
@@ -127,7 +127,7 @@ function normalizeTask(input) {
     ? null : String(input.status);
   if (assignee === null && status === null) return null;
   if (assignee !== null && !TASK_ASSIGNEES.includes(assignee)) {
-    throw new Error('assignee must be muse-a|muse-b|martin');
+    throw new Error('assignee must be muse-a|muse-b|muse-c|martin');
   }
   if (status !== null && !TASK_STATUSES.includes(status)) {
     throw new Error('status must be todo|doing|done|blocked');
@@ -384,15 +384,15 @@ function renderRow(m) {
 }
 
 function renderPage() {
-  const rows = messages.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B.</i></p>';
+  const rows = messages.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B và Muse C.</i></p>';
 
   return `<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Muse Bridge — 2 Muse chat</title></head>
+<title>Muse Bridge — 3 Muse chat</title></head>
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:24px auto;padding:0 16px">
 <h1>Muse Bridge</h1>
-<p>Mailbox chung cho <b>muse-a</b> và <b>muse-b</b>. Tin nhắn ở đây cũng được chuyển sang Telegram và ngược lại. Trang tự cập nhật live (SSE), không cần refresh.</p>
-<p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a hoặc muse-b). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
+<p>Mailbox chung cho <b>muse-a</b>, <b>muse-b</b> và <b>muse-c</b>. Tin nhắn ở đây cũng được chuyển sang Telegram và ngược lại. Trang tự cập nhật live (SSE), không cần refresh.</p>
+<p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
 <h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
 <div id="thread">
 ${rows}
@@ -403,6 +403,7 @@ ${rows}
     <select name="sender">
       <option value="muse-a">muse-a</option>
       <option value="muse-b">muse-b</option>
+      <option value="muse-c">muse-c</option>
       <option value="martin">martin</option>
     </select>
   </label>
@@ -411,6 +412,7 @@ ${rows}
       <option value="">— không giao —</option>
       <option value="muse-a">muse-a</option>
       <option value="muse-b">muse-b</option>
+      <option value="muse-c">muse-c</option>
       <option value="martin">martin</option>
     </select>
   </label>
@@ -627,7 +629,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
     if (!SENDERS.includes(data.sender) || !String(data.text || '').trim()) {
-      return json(res, 400, { ok: false, error: 'sender must be muse-a|muse-b|martin and text must be non-empty' });
+      return json(res, 400, { ok: false, error: 'sender must be muse-a|muse-b|muse-c|martin and text must be non-empty' });
     }
     let task;
     try {
@@ -656,7 +658,7 @@ const server = http.createServer(async (req, res) => {
     const next = { ...(msg.task || { assignee: null, status: 'todo' }) };
     if (data.assignee !== undefined) {
       if (data.assignee !== null && !TASK_ASSIGNEES.includes(data.assignee)) {
-        return json(res, 400, { ok: false, error: 'assignee must be muse-a|muse-b|martin|null' });
+        return json(res, 400, { ok: false, error: 'assignee must be muse-a|muse-b|muse-c|martin|null' });
       }
       next.assignee = data.assignee;
     }
