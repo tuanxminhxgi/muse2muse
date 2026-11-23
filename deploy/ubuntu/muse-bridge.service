@@ -6,9 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=martin
-WorkingDirectory=/home/martin/muse2muse
-EnvironmentFile=/etc/muse-bridge.env
-ExecStart=/usr/bin/node server.js
+WorkingDirectory=/home/martin/Desktop/project/muse2muse
+ExecStart=/home/martin/.local/share/mise/installs/node/latest/bin/node server.js
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=60

@@ -6,7 +6,7 @@ Wants=network-online.target muse-bridge.service
 [Service]
 Type=simple
 User=martin
-ExecStart=/usr/bin/cloudflared tunnel --url http://127.0.0.1:8797
+ExecStart=/usr/bin/cloudflared tunnel --config /home/martin/.cloudflared/config.yml run muse-bridge-ubuntu
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=60
