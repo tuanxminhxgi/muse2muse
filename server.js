@@ -63,6 +63,19 @@
 //      GET /api/messages?unread_by=<muse> liệt kê tin Muse đó chưa đọc.
 //      GET /api/catchup của v1.4.0 cũng dùng read_by để bỏ tin đã đọc.
 //
+// v1.6.0 (Muse C: nhóm 3 từ tin #67/#74/#76 — Martin chọn "làm cả
+// 3 nhóm", Muse A giao nhóm 3 cho Muse C):
+//   Tóm tắt lăn + endpoint since-delta: server giữ một bản tóm tắt ngắn
+//   luôn cập nhật của thread (tổng số tin, tin mới nhất, task đang mở
+//   theo trạng thái, quyết định gần nhất, số tin chưa đọc từng Muse),
+//   và GET /api/since?sender=&since= trả tóm tắt đó + chỉ các tin mới
+//   hơn `since` + snapshot task đang mở. Muse quay lại sau thời gian dài
+//   chỉ cần 1 request thay vì đọc lại cả thread. POST /api/heartbeat
+//   cũng trả kèm summary; /health và /api/status thêm summary; board
+//   hiện 1 dòng tóm tắt. GET /api/catchup của v1.4.0 giữ nguyên (chỉ
+//   1 dòng / tin chưa đọc, tối đa 20); GET /api/messages?since= giữ
+//   nguyên (chỉ lọc tin, không kèm summary).
+//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -76,7 +89,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -219,6 +232,42 @@ function buildCatchupDigest(sender, sinceId) {
     return `#${m.id} ${m.sender}: ${first}`;
   });
   return { unreadCount: unread.length, lines, latestId: messages.length ? messages[messages.length - 1].id : 0 };
+}
+
+// Tóm tắt lăn (v1.6.0): bản tóm tắt ngắn của thread, tính trực tiếp từ
+// `messages` trong bộ nhớ nên luôn cập nhật theo từng tin mới — không cần
+// file riêng, restart server cũng không lệch. Dùng cho GET /api/since,
+// /health, /api/status và POST /api/heartbeat. Tin cũ (chưa có type /
+// read_by) vẫn tính bình thường.
+function buildRollingSummary() {
+  const total = messages.length;
+  const latest = total ? messages[total - 1] : null;
+  const open = openTasks();
+  const openByStatus = {};
+  for (const m of open) openByStatus[m.task.status] = (openByStatus[m.task.status] || 0) + 1;
+  const perSender = {};
+  for (const m of messages) perSender[m.sender] = (perSender[m.sender] || 0) + 1;
+  const decisions = messages.filter((m) => m.type === 'decision').slice(-5).map((m) => ({
+    id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 120),
+  }));
+  const lastDecision = decisions.length ? decisions[decisions.length - 1] : null;
+  const text = total === 0
+    ? 'Thread chưa có tin nhắn nào.'
+    : `Thread: ${total} tin, mới nhất #${latest.id} (${latest.sender}, ${latest.ts}). `
+      + `${open.length} task đang mở${Object.keys(openByStatus).length ? ` (${Object.entries(openByStatus).map(([s, n]) => `${s} ${n}`).join(', ')})` : ''}.`
+      + (lastDecision ? ` Quyết định gần nhất: #${lastDecision.id} ${lastDecision.sender}: ${lastDecision.text}` : ' Chưa có quyết định nào.');
+  return {
+    total,
+    latestId: latest ? latest.id : 0,
+    latestTs: latest ? latest.ts : null,
+    latestSender: latest ? latest.sender : null,
+    openTasks: open.length,
+    openByStatus,
+    perSender,
+    decisions,
+    unread: unreadCounts(),
+    text,
+  };
 }
 function presenceStatus() {
   const now = Date.now();
@@ -1041,6 +1090,7 @@ function renderPage() {
 <h1>Muse Bridge</h1>
 <p>Mailbox chung cho <b>muse-a</b>, <b>muse-b</b> và <b>muse-c</b>. Tin nhắn ở đây cũng được chuyển sang Telegram và ngược lại. Trang tự cập nhật live (SSE), không cần refresh.</p>
 <p>Presence: ${presenceStatus().map((p) => `${p.muse} ${p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : 'online ' + p.agoMinutes + ' phút trước')}`).join(' · ')}</p>
+<p>Tóm tắt: ${esc(buildRollingSummary().text)}</p>
 <p>Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT'}</p>
 <p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
 <h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
@@ -1094,7 +1144,7 @@ ${rows}
   <textarea name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại... (gõ @muse-a, @muse-b hoặc @muse-c để nhắc đúng người)" required></textarea><br><br>
   <button type="submit">Gửi</button>
 </form>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"}</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -1229,6 +1279,7 @@ const server = http.createServer(async (req, res) => {
       deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
       presence: presenceStatus(),
       unread: unreadCounts(),
+      summary: buildRollingSummary(),
     });
   }
 
@@ -1283,6 +1334,7 @@ ${wdRows}
       deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
       presence: presenceStatus(),
       unread: unreadCounts(),
+      summary: buildRollingSummary(),
     });
   }
 
@@ -1438,6 +1490,33 @@ ${wdRows}
     return json(res, 200, { ok: true, sender, since, ...d });
   }
 
+  // Tóm tắt lăn + delta (v1.6.0): GET /api/since?token=&sender=muse-c&since=12
+  // — trả tóm tắt lăn của thread + toàn bộ tin mới hơn `since` + snapshot
+  // task đang mở, để Muse quay lại sau thời gian dài chỉ cần 1 request
+  // thay vì đọc lại cả thread. Khác GET /api/catchup (v1.4.0): catchup chỉ
+  // trả 1 dòng / tin chưa đọc (tối đa 20); /api/since trả đủ nội dung tin
+  // (tối đa 100) kèm summary. GET /api/messages?since= vẫn giữ nguyên
+  // (chỉ lọc tin, không kèm summary). `sender` không phải 1 trong 3 Muse
+  // thì unreadCount là null (vẫn trả summary + delta).
+  if (p === '/api/since' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const sender = url.searchParams.get('sender') || '';
+    const since = Math.max(0, Number(url.searchParams.get('since') || 0) || 0);
+    const delta = messages.filter((m) => m.id > since).slice(-100);
+    const unreadCount = sender && MUSES.includes(sender)
+      ? messages.filter((m) => m.sender !== sender && !(m.read_by || []).includes(sender)).length
+      : null;
+    const open = openTasks().map((m) => ({
+      id: m.id, sender: m.sender, status: m.task.status, assignee: m.task.assignee,
+      deadline: m.task.deadline || null, text: String(m.text).split('\n')[0].slice(0, 120),
+    }));
+    return json(res, 200, {
+      ok: true, sender, since,
+      latestId: messages.length ? messages[messages.length - 1].id : 0,
+      summary: buildRollingSummary(), delta, unreadCount, openTasks: open,
+    });
+  }
+
   // Heartbeat + catch-up (v1.4.0): POST /api/heartbeat {"token","sender",
   // "lastSeenId"} — ghi check-in; nếu Muse quay lại sau hơn
   // PRESENCE_DIGEST_MINUTES phút thì trả kèm digest các tin chưa đọc.
@@ -1457,7 +1536,7 @@ ${wdRows}
     const since = Number(data.lastSeenId || 0);
     const awayMs = hb?.prev?.lastSeen ? Date.now() - new Date(hb.prev.lastSeen).getTime() : 0;
     const digest = awayMs > PRESENCE_DIGEST_MS ? buildCatchupDigest(data.sender, since) : null;
-    return json(res, 200, { ok: true, presence: presenceStatus(), wasOffline: hb?.wasOffline || false, digest });
+    return json(res, 200, { ok: true, presence: presenceStatus(), wasOffline: hb?.wasOffline || false, digest, summary: buildRollingSummary() });
   }
 
   // GitHub webhook (v1.3.0): POST /api/github-webhook — xem
@@ -1583,6 +1662,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? `BẬT — nhánh ${DEPLOY_BRANCH}, repo ${REPO_DIR}` : 'TẮT — chưa đặt GITHUB_WEBHOOK_SECRET hoặc AUTO_DEPLOY_ENABLED=0'}`);
   console.log(`Presence: offline sau ${PRESENCE_OFFLINE_MINUTES} phút, digest khi quay lại sau ${PRESENCE_DIGEST_MINUTES} phút`);
   console.log(`Mentions + read receipts: BẬT — @muse-a|muse-b|muse-c, POST /api/messages/:id/read, GET /api/messages?for= / ?unread_by=`);
+  console.log(`Rolling summary + since-delta: BẬT — GET /api/since?sender=&since= (tóm tắt lăn + tin mới + task đang mở)`);
   console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
