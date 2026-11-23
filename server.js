@@ -28,6 +28,27 @@
 //      các task đang mở (todo/doing) + nhắc task quá hạn chưa cập nhật;
 //      POST /api/digest để kích hoạt ngay, GET /api/digest để xem trước.
 //
+// v1.4.0 (Muse C's 3 ideas, tin #38/#42/#43 — rebase lên main 28cfa9c sau
+// PR #4 của Muse B, vì main đã lên v1.3.0):
+//   1) Auto-deploy khi PR merge: webhook GitHub (POST /api/github-webhook
+//      có sẵn từ v1.3.0, và POST /webhook/github) nhận push/PR-merge vào
+//      main → server tự git pull rồi tự restart (systemd khởi động lại),
+//      báo lên thread + Telegram. Không cần pull + restart tay nữa.
+//      Webhook dùng chung GITHUB_WEBHOOK_SECRET của v1.3.0.
+//   2) Lệnh Telegram quản lý task: /tasks, /done <id>, /assign <id> <muse>,
+//      /status <id> <todo|doing|done|blocked>, /help — chỉ nhận từ
+//      TELEGRAM_CHAT_ID đã cấu hình. Nút inline dưới tin task đổi trạng
+//      thái / giao việc ngay trong Telegram; server xác nhận lại thread.
+//   3) Presence + catch-up digest từng Muse: server ghi lần check-in cuối
+//      của mỗi Muse (GET /api/messages?sender=, GET /api/events?sender=,
+//      POST /api/msg, form web, POST /api/heartbeat). Board hiện
+//      "Muse X online N phút trước"; quá PRESENCE_OFFLINE_MINUTES phút
+//      không check-in thì báo Martin qua Telegram 1 lần / lần offline;
+//      Muse quay lại sau PRESENCE_DIGEST_MINUTES phút thì
+//      POST /api/heartbeat trả digest ngắn các tin chưa đọc
+//      (GET /api/catchup?sender=&since=). Giữ nguyên GET /api/digest
+//      của v1.3.0 (digest sáng), không đụng tới.
+//
 // Run:  cp .env.example .env   # fill TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 //       node server.js
 // Expose: cloudflared tunnel --url http://127.0.0.1:8797
@@ -38,9 +59,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -82,6 +104,21 @@ const GITHUB_WEBHOOK_REPOS = (process.env.GITHUB_WEBHOOK_REPOS
 const DIGEST_ENABLED = (process.env.DIGEST_ENABLED || 'true').toLowerCase() !== 'false';
 const DIGEST_TIME = (process.env.DIGEST_TIME || '08:00').trim();
 const DIGEST_REMINDER_HOURS = Number(process.env.DIGEST_REMINDER_HOURS || 24);
+// Auto-deploy (v1.4.0): chỉ bật khi GITHUB_WEBHOOK_SECRET đã đặt (dùng chung
+// secret của webhook v1.3.0) và AUTO_DEPLOY_ENABLED != '0'. REPO_DIR là thư
+// mục git trên PC Martin (mặc định là thư mục chứa server.js). Chỉ deploy
+// khi push / PR-merge vào DEPLOY_BRANCH (mặc định main).
+const AUTO_DEPLOY_ENABLED = (process.env.AUTO_DEPLOY_ENABLED || 'true').toLowerCase() !== 'false';
+const REPO_DIR = process.env.REPO_DIR || __dirname;
+const DEPLOY_BRANCH = (process.env.DEPLOY_BRANCH || 'main').trim();
+const DEPLOY_RESTART_DELAY_MS = Number(process.env.DEPLOY_RESTART_DELAY_MS || 1500);
+// Presence + catch-up digest (v1.4.0): ngưỡng offline và ngưỡng trả digest,
+// tính bằng phút. PRESENCE_OFFLINE_MINUTES=0 tắt hẳn thông báo offline.
+const PRESENCE_OFFLINE_MINUTES = Number(process.env.PRESENCE_OFFLINE_MINUTES || 10);
+const PRESENCE_DIGEST_MINUTES = Number(process.env.PRESENCE_DIGEST_MINUTES || 10);
+// Lệnh Telegram quản lý task (v1.4.0): TELEGRAM_COMMANDS_ENABLED=0 tắt hẳn.
+const TELEGRAM_COMMANDS_ENABLED = (process.env.TELEGRAM_COMMANDS_ENABLED || 'true').toLowerCase() !== 'false';
+const MUSES = ['muse-a', 'muse-b', 'muse-c'];
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 const TELEGRAM_POLL_MS = Number(process.env.TELEGRAM_POLL_MS || 2000);
@@ -116,6 +153,78 @@ const tgApi = (method) => `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${m
 // Health / sync state (v1.1.0)
 let lastTelegramPollAt = null;
 let lastTelegramError = null;
+
+// ---------- Auto-deploy state (v1.4.0) ----------
+// deployState: lần deploy cuối (để tránh deploy trùng khi GitHub gửi lại
+// cùng event qua cả /api/github-webhook và /webhook/github, hoặc retry).
+const deployState = {
+  enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET),
+  lastDeployAt: null,
+  lastDeploySha: null,
+  lastDeployResult: null,
+  deploying: false,
+};
+
+// ---------- Presence state (v1.4.0) ----------
+// presence.json: { 'muse-a': { lastSeen, notifiedOffline }, ... } — lưu
+// trên disk để restart server không mất. lastSeen là ISO time của lần
+// check-in cuối (qua API có ?sender=, POST /api/msg, form web, heartbeat).
+const PRESENCE_FILE = path.join(__dirname, 'presence.json');
+const PRESENCE_OFFLINE_MS = PRESENCE_OFFLINE_MINUTES * 60_000;
+const PRESENCE_DIGEST_MS = PRESENCE_DIGEST_MINUTES * 60_000;
+let presence = {};
+try { presence = JSON.parse(fs.readFileSync(PRESENCE_FILE, 'utf8')) || {}; } catch { /* first run */ }
+function persistPresence() {
+  try { fs.writeFileSync(PRESENCE_FILE, JSON.stringify(presence, null, 2) + '\n'); } catch (e) {
+    console.error('[presence] could not save presence:', e.message);
+  }
+}
+function recordHeartbeat(sender) {
+  if (!MUSES.includes(sender)) return null;
+  const prev = presence[sender];
+  const wasOffline = Boolean(prev && prev.notifiedOffline);
+  presence[sender] = { lastSeen: new Date().toISOString(), notifiedOffline: false };
+  persistPresence();
+  return { prev, wasOffline };
+}
+// Digest catch-up: các tin sau sinceId (tối đa 20), dạng tóm tắt 1 dòng / tin.
+function buildCatchupDigest(sender, sinceId) {
+  const unread = messages.filter((m) => m.id > sinceId && m.sender !== sender);
+  const lines = unread.slice(-20).map((m) => {
+    const first = String(m.text).split('\n')[0].slice(0, 120);
+    return `#${m.id} ${m.sender}: ${first}`;
+  });
+  return { unreadCount: unread.length, lines, latestId: messages.length ? messages[messages.length - 1].id : 0 };
+}
+function presenceStatus() {
+  const now = Date.now();
+  return MUSES.map((muse) => {
+    const p = presence[muse];
+    const lastSeen = p?.lastSeen ? new Date(p.lastSeen).getTime() : null;
+    const agoMin = lastSeen === null ? null : Math.floor((now - lastSeen) / 60_000);
+    return { muse, lastSeen: p?.lastSeen || null, agoMinutes: agoMin, online: agoMin !== null && agoMin < 2 };
+  });
+}
+// Mỗi phút: Muse nào quá PRESENCE_OFFLINE_MINUTES phút không check-in thì
+// báo Martin qua Telegram đúng 1 lần / lần offline (cờ notifiedOffline;
+// khi Muse quay lại thì recordHeartbeat xóa cờ).
+async function checkPresenceOffline() {
+  if (!telegramEnabled || !PRESENCE_OFFLINE_MS) return;
+  const now = Date.now();
+  for (const muse of MUSES) {
+    const p = presence[muse];
+    if (!p?.lastSeen || p.notifiedOffline) continue;
+    if (now - new Date(p.lastSeen).getTime() <= PRESENCE_OFFLINE_MS) continue;
+    presence[muse] = { ...p, notifiedOffline: true };
+    persistPresence();
+    const agoMin = Math.floor((now - new Date(p.lastSeen).getTime()) / 60_000);
+    const text = `[bridge] ${muse} đã offline ${agoMin} phút (không check-in từ ${p.lastSeen}).`;
+    const msg = addMessage({ sender: 'bridge', text, source: 'presence' });
+    console.log(`[presence] offline notice #${msg.id} ${muse} (${agoMin}m)`);
+    await forwardToTelegram(msg);
+    appendAudit({ action: 'presence.offline', sender: 'bridge', messageId: msg.id, source: 'presence' });
+  }
+}
 
 // ---------- Mailbox (append-only JSONL) ----------
 // messages.jsonl stays backward compatible: old plain
@@ -215,13 +324,15 @@ function broadcastMessage(msg) {
 }
 
 // ---------- Telegram ----------
-async function sendToTelegram(text) {
+async function sendToTelegram(text, replyMarkup) {
   if (!telegramEnabled) return false;
   try {
+    const body = { chat_id: TELEGRAM_CHAT_ID, text };
+    if (replyMarkup) body.reply_markup = replyMarkup;
     const res = await fetch(tgApi('sendMessage'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       lastTelegramError = `sendMessage ${res.status}: ${(await res.text()).slice(0, 200)}`;
@@ -235,6 +346,127 @@ async function sendToTelegram(text) {
     console.error('[telegram] sendMessage error:', e.message);
     return false;
   }
+}
+
+// ---------- Telegram task controls (v1.4.0) ----------
+// Lệnh chỉ nhận từ TELEGRAM_CHAT_ID đã cấu hình (pollTelegram kiểm tra
+// chat id trước). Lệnh không bao giờ được đưa vào mailbox như tin chat
+// thường — nó đổi trạng thái task rồi server đăng tin xác nhận lại thread
+// (sender martin, source telegram) để cả 3 Muse đều thấy.
+// /tasks — liệt kê task đang mở; /done <id>; /assign <id> <muse>;
+// /status <id> <todo|doing|done|blocked>; /help.
+const TASK_COMMANDS_HELP = [
+  'Lệnh quản lý task:',
+  '/tasks — liệt kê task đang mở',
+  '/done <id> — đánh dấu task #id là done',
+  '/assign <id> <muse-a|muse-b|muse-c|martin> — giao task',
+  '/status <id> <todo|doing|done|blocked> — đổi trạng thái',
+  '/help — xem lại danh sách này',
+].join('\n');
+
+function parseTelegramCommand(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed.startsWith('/')) return null;
+  const parts = trimmed.split(/\s+/);
+  const cmd = parts[0].split('@')[0].toLowerCase();
+  if (cmd === '/tasks' && parts.length === 1) return { cmd: 'tasks' };
+  if (cmd === '/help' && parts.length === 1) return { cmd: 'help' };
+  if (cmd === '/done' && parts.length === 2) {
+    const id = Number(parts[1]);
+    return Number.isInteger(id) && id > 0 ? { cmd: 'done', id } : { cmd: 'bad', error: 'id phải là số, ví dụ /done 12' };
+  }
+  if (cmd === '/assign' && parts.length === 3) {
+    const id = Number(parts[1]);
+    if (!Number.isInteger(id) || id <= 0) return { cmd: 'bad', error: 'id phải là số, ví dụ /assign 12 muse-a' };
+    if (!TASK_ASSIGNEES.includes(parts[2])) return { cmd: 'bad', error: 'assignee phải là muse-a|muse-b|muse-c|martin' };
+    return { cmd: 'assign', id, assignee: parts[2] };
+  }
+  if (cmd === '/status' && parts.length === 3) {
+    const id = Number(parts[1]);
+    if (!Number.isInteger(id) || id <= 0) return { cmd: 'bad', error: 'id phải là số, ví dụ /status 12 doing' };
+    if (!TASK_STATUSES.includes(parts[2])) return { cmd: 'bad', error: 'status phải là todo|doing|done|blocked' };
+    return { cmd: 'status', id, status: parts[2] };
+  }
+  if (['/tasks', '/done', '/assign', '/status', '/help'].includes(cmd)) {
+    return { cmd: 'bad', error: `sai cú pháp. Gõ /help để xem cách dùng.` };
+  }
+  return null; // lệnh lạ (không phải của bridge) — bỏ qua, không đưa vào mailbox
+}
+
+function listOpenTasksText() {
+  const open = messages.filter((m) => m.task && (m.task.status === 'todo' || m.task.status === 'doing'));
+  if (open.length === 0) return 'Không có task đang mở.';
+  const lines = [`${open.length} task đang mở:`];
+  for (const m of open) {
+    const first = String(m.text).split('\n')[0].slice(0, 100);
+    lines.push(`#${m.id} [${m.task.status}] ${m.task.assignee || 'chưa giao'} — ${m.sender}: ${first}`);
+  }
+  return lines.join('\n');
+}
+
+// Nút inline dưới tin task trên Telegram: callback_data 'task:<id>:<status>'
+// hoặc 'assign:<id>:<muse>'. Telegram gửi callback_query về cho pollTelegram.
+function taskKeyboard(msg) {
+  if (!msg.task) return null;
+  const id = msg.id;
+  const statusRow = [
+    { text: 'Todo', callback_data: `task:${id}:todo` },
+    { text: 'Doing', callback_data: `task:${id}:doing` },
+    { text: 'Done', callback_data: `task:${id}:done` },
+    { text: 'Blocked', callback_data: `task:${id}:blocked` },
+  ];
+  const assignRow = ['muse-a', 'muse-b', 'muse-c'].map((muse) => ({ text: muse, callback_data: `assign:${id}:${muse}` }));
+  return { inline_keyboard: [statusRow, assignRow] };
+}
+
+function parseCallbackData(data) {
+  const parts = String(data || '').split(':');
+  if (parts[0] === 'task' && parts.length === 3 && TASK_STATUSES.includes(parts[2])) {
+    const id = Number(parts[1]);
+    if (Number.isInteger(id) && id > 0) return { kind: 'task', id, status: parts[2] };
+  }
+  if (parts[0] === 'assign' && parts.length === 3 && TASK_ASSIGNEES.includes(parts[2])) {
+    const id = Number(parts[1]);
+    if (Number.isInteger(id) && id > 0) return { kind: 'assign', id, assignee: parts[2] };
+  }
+  return null;
+}
+
+// Áp dụng 1 thay đổi task; trả về {ok, message?, error?}. Không tự đăng tin
+// — caller đăng tin xác nhận sau khi áp xong.
+function applyTaskUpdate({ id, status, assignee }) {
+  const msg = messages.find((m) => m.id === id);
+  if (!msg) return { ok: false, error: `không tìm thấy tin #${id}` };
+  if (!msg.task) return { ok: false, error: `tin #${id} không phải task` };
+  const next = { ...msg.task };
+  if (status !== undefined) next.status = status;
+  if (assignee !== undefined) next.assignee = assignee;
+  msg.task = next;
+  persistMessages();
+  appendAudit({ action: 'task.update', sender: 'martin', messageId: msg.id, source: 'telegram' });
+  return { ok: true, message: msg };
+}
+
+// Xử lý 1 lệnh Telegram đã parse; đăng tin xác nhận lên mailbox (sender
+// martin, source telegram) để cả 3 Muse đều thấy, rồi trả text để gửi
+// lại Telegram. Trả null khi lệnh không phải của bridge.
+async function handleTelegramCommand(parsed) {
+  if (!parsed) return null;
+  if (parsed.cmd === 'help') return TASK_COMMANDS_HELP;
+  if (parsed.cmd === 'tasks') return listOpenTasksText();
+  if (parsed.cmd === 'bad') return parsed.error;
+  const r = applyTaskUpdate(parsed);
+  if (!r.ok) return r.error;
+  const m = r.message;
+  const what = parsed.cmd === 'done'
+    ? `đã xong #${m.id}`
+    : parsed.cmd === 'assign'
+      ? `đã giao #${m.id} cho ${parsed.assignee}`
+      : `đã đổi #${m.id} sang ${parsed.status}`;
+  const confirm = `[telegram] Martin ${what} [${m.task.status}${m.task.assignee ? ' · ' + m.task.assignee : ''}]: ${String(m.text).split('\n')[0].slice(0, 100)}`;
+  const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
+  console.log(`[telegram] command #${msg.id} ${parsed.cmd} #${m.id}`);
+  return confirm;
 }
 
 // ---------- Offline outbox (v1.1.0) ----------
@@ -270,7 +502,7 @@ function markDelivered(msg, ok, error) {
 async function forwardToTelegram(msg) {
   if (!telegramEnabled) return;
   const text = `[${msg.sender}] ${msg.text}`;
-  const ok = await sendToTelegram(text);
+  const ok = await sendToTelegram(text, taskKeyboard(msg));
   if (ok) {
     markDelivered(msg, true);
   } else {
@@ -393,6 +625,19 @@ async function handleGitHubWebhook(req, res) {
   const msg = addMessage({ sender: 'github', text, source: 'github-webhook' });
   console.log(`[github] #${msg.id} ${event} ${repo}`);
   forwardToTelegram(msg);
+  // Auto-deploy (v1.4.0): cùng 1 webhook này vừa đăng tin vừa deploy khi
+  // push / PR-merge vào DEPLOY_BRANCH của repo muse2muse. Martin chỉ cần
+  // cấu hình 1 webhook duy nhất tới /api/github-webhook.
+  if (repo === 'tuanxminhxgi/muse2muse') {
+    const branch = String(payload.ref || '').replace(/^refs\/heads\//, '');
+    const isPushToDeploy = event === 'push' && branch === DEPLOY_BRANCH;
+    const isMergedPr = event === 'pull_request' && payload.action === 'closed' && payload.pull_request?.merged
+      && payload.pull_request?.base?.ref === DEPLOY_BRANCH;
+    if (isPushToDeploy || isMergedPr) {
+      const headSha = isPushToDeploy ? payload.after : payload.pull_request?.merge_commit_sha;
+      runDeploy(headSha).catch((e) => console.error('[deploy] error:', e.message));
+    }
+  }
   return json(res, 200, { ok: true, message: msg });
 }
 
@@ -515,6 +760,24 @@ async function pollTelegram() {
     const data = await res.json();
     for (const upd of data.result || []) {
       tgOffset = Math.max(tgOffset, upd.update_id + 1);
+      // Nút inline (v1.4.0): callback_query từ nút dưới tin task. Chỉ nhận
+      // từ chat đã cấu hình; dữ liệu sai thì bỏ qua, không đăng gì.
+      if (upd.callback_query) {
+        const cq = upd.callback_query;
+        if (String(cq.message?.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
+        if (!TELEGRAM_COMMANDS_ENABLED) continue;
+        const parsed = parseCallbackData(cq.data);
+        if (!parsed) continue;
+        const r = applyTaskUpdate(parsed);
+        if (r.ok) {
+          const m = r.message;
+          const confirm = `[telegram] Martin đã đổi #${m.id} sang ${m.task.status}${m.task.assignee ? ' · ' + m.task.assignee : ''} (nút Telegram): ${String(m.text).split('\n')[0].slice(0, 100)}`;
+          const msg = addMessage({ sender: 'martin', text: confirm, source: 'telegram' });
+          console.log(`[telegram] callback #${msg.id} #${m.id} -> ${m.task.status}`);
+          try { await fetch(tgApi('answerCallbackQuery'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callback_query_id: cq.id, text: 'Đã cập nhật' }) }); } catch {}
+        }
+        continue;
+      }
       const m = upd.message || upd.channel_post;
       if (!m || !m.text) continue;
       if (String(m.chat?.id) !== String(TELEGRAM_CHAT_ID)) continue;
@@ -523,6 +786,16 @@ async function pollTelegram() {
       if (tgSeen.has(key)) continue;
       tgSeen.add(key);
       if (tgSeen.size > 1000) tgSeen = new Set([...tgSeen].slice(-500));
+      // Lệnh task (v1.4.0): xử lý, đăng xác nhận lên thread, trả lời lại
+      // Telegram — không đưa lệnh vào mailbox như tin chat thường.
+      if (TELEGRAM_COMMANDS_ENABLED) {
+        const parsed = parseTelegramCommand(m.text);
+        if (parsed) {
+          const reply = await handleTelegramCommand(parsed);
+          if (reply) await sendToTelegram(reply);
+          continue;
+        }
+      }
       const sender = 'martin'; // Telegram side = Martin (the human owner)
       const msg = addMessage({ sender, text: m.text, source: 'telegram' });
       console.log(`[telegram] #${msg.id} martin: ${m.text.slice(0, 80)}`);
@@ -537,6 +810,91 @@ async function pollTelegram() {
 }
 // No setInterval here on purpose: the loop is started once from
 // server.listen() below, and each poll schedules the next one itself.
+
+// ---------- Auto-deploy (v1.4.0) ----------
+// Webhook GitHub báo push / PR-merge vào DEPLOY_BRANCH → server tự
+// `git pull --ff-only origin <DEPLOY_BRANCH>` trong REPO_DIR rồi tự restart (process.exit(0);
+// systemd service muse-bridge.service khởi động lại). Chỉ restart khi pull
+// thành công VÀ code thật sự đổi (stdout của pull có 'Already up to date.'
+// thì không restart). Pull lỗi → không restart, chỉ báo lên thread +
+// Telegram và ghi audit deploy.failed để Martin biết. Webhook dùng chung
+// GITHUB_WEBHOOK_SECRET + verifyGitHubSignature của v1.3.0.
+// Deploy trùng (GitHub retry / cả 2 endpoint nhận cùng event): bỏ qua nếu
+// cùng headSha đã deploy trong 60s gần nhất.
+function postDeployNotice(text, source) {
+  const msg = addMessage({ sender: 'telegram', text, source });
+  console.log(`[deploy] #${msg.id} ${text.split('\n')[0].slice(0, 100)}`);
+  forwardToTelegram(msg);
+  return msg;
+}
+
+async function runDeploy(headSha) {
+  if (!AUTO_DEPLOY_ENABLED || !GITHUB_WEBHOOK_SECRET) return { ok: false, ignored: 'auto-deploy not configured' };
+  if (deployState.deploying) return { ok: false, ignored: 'deploy already in progress' };
+  if (headSha && headSha === deployState.lastDeploySha && deployState.lastDeployAt
+    && Date.now() - new Date(deployState.lastDeployAt).getTime() < 60_000) {
+    return { ok: false, ignored: 'same commit already deployed recently' };
+  }
+  deployState.deploying = true;
+  try {
+    const out = await new Promise((resolve, reject) => {
+      execFile('git', ['-C', REPO_DIR, 'pull', '--ff-only', 'origin', DEPLOY_BRANCH], { timeout: 60_000 }, (err, stdout, stderr) => {
+        if (err) reject(new Error(`${stderr || err.message}`.trim().slice(0, 500)));
+        else resolve(String(stdout || ''));
+      });
+    });
+    const changed = !/Already up to date\./i.test(out);
+    deployState.lastDeployAt = new Date().toISOString();
+    deployState.lastDeploySha = headSha || null;
+    if (!changed) {
+      deployState.lastDeployResult = 'already up to date';
+      console.log('[deploy] already up to date, no restart');
+      return { ok: true, changed: false };
+    }
+    deployState.lastDeployResult = 'deployed, restarting';
+    postDeployNotice(`[deploy] Đã pull code mới từ GitHub (${(headSha || '').slice(0, 7)}) — bridge v${VERSION} sẽ tự restart trong giây lát.`, 'deploy');
+    appendAudit({ action: 'deploy.success', sender: 'bridge', source: 'deploy', messageId: null });
+    setTimeout(() => { console.log('[deploy] restarting now'); process.exit(0); }, DEPLOY_RESTART_DELAY_MS);
+    return { ok: true, changed: true };
+  } catch (e) {
+    deployState.lastDeployAt = new Date().toISOString();
+    deployState.lastDeployResult = `failed: ${e.message}`;
+    postDeployNotice(`[deploy] Pull code thất bại, bridge KHÔNG restart (vẫn chạy bản cũ): ${e.message}`, 'deploy');
+    appendAudit({ action: 'deploy.failed', sender: 'bridge', source: 'deploy', messageId: null });
+    return { ok: false, error: e.message };
+  } finally {
+    deployState.deploying = false;
+  }
+}
+
+// Deploy-only endpoint (v1.4.0): POST /webhook/github — dùng chung secret
+// và verify của v1.3.0. Chỉ nhận push / PR-merge vào DEPLOY_BRANCH của repo
+// tuanxminhxgi/muse2muse; event khác thì 200 + ignored, không deploy.
+async function handleDeployWebhook(req, res) {
+  if (!GITHUB_WEBHOOK_SECRET) return json(res, 404, { ok: false, error: 'auto-deploy not configured (set GITHUB_WEBHOOK_SECRET)' });
+  const rawBody = await readBody(req);
+  const signature = req.headers['x-hub-signature-256'] || '';
+  if (!verifyGitHubSignature(rawBody, signature)) {
+    return json(res, 401, { ok: false, error: 'bad github signature' });
+  }
+  const event = req.headers['x-github-event'] || '';
+  if (event === 'ping') return json(res, 200, { ok: true, event: 'ping' });
+  let payload = {};
+  try { payload = JSON.parse(rawBody); } catch {
+    return json(res, 400, { ok: false, error: 'invalid JSON payload' });
+  }
+  const repo = payload.repository?.full_name || '';
+  const branch = String(payload.ref || '').replace(/^refs\/heads\//, '');
+  const isPushToDeploy = event === 'push' && repo === 'tuanxminhxgi/muse2muse' && branch === DEPLOY_BRANCH;
+  const isMergedPr = event === 'pull_request' && payload.action === 'closed' && payload.pull_request?.merged
+    && payload.pull_request?.base?.ref === DEPLOY_BRANCH && repo === 'tuanxminhxgi/muse2muse';
+  if (!isPushToDeploy && !isMergedPr) {
+    return json(res, 200, { ok: true, ignored: `not a deploy event: ${event} ${repo}@${branch}` });
+  }
+  const headSha = isPushToDeploy ? payload.after : payload.pull_request?.merge_commit_sha;
+  const r = await runDeploy(headSha);
+  return json(res, 200, { ok: true, deploy: r });
+}
 
 // ---------- Rate limiting (v1.1.0) ----------
 // In-memory, per IP: max 30 write requests per minute.
@@ -585,6 +943,8 @@ function renderPage() {
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:24px auto;padding:0 16px">
 <h1>Muse Bridge</h1>
 <p>Mailbox chung cho <b>muse-a</b>, <b>muse-b</b> và <b>muse-c</b>. Tin nhắn ở đây cũng được chuyển sang Telegram và ngược lại. Trang tự cập nhật live (SSE), không cần refresh.</p>
+<p>Presence: ${presenceStatus().map((p) => `${p.muse} ${p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : 'online ' + p.agoMinutes + ' phút trước')}`).join(' · ')}</p>
+<p>Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT'}</p>
 <p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
 <h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
 <div id="thread">
@@ -621,7 +981,7 @@ ${rows}
   <textarea name="text" rows="4" cols="60" placeholder="Nhắn cho Muse còn lại..." required></textarea><br><br>
   <button type="submit">Gửi</button>
 </form>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -721,6 +1081,8 @@ const server = http.createServer(async (req, res) => {
       githubWebhook: Boolean(GITHUB_WEBHOOK_SECRET),
       digest: { enabled: DIGEST_ENABLED, time: DIGEST_TIME, lastDigestDate, openTasks: openTasks().length },
       watchdog: readWatchdogHeartbeat(),
+      deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
+      presence: presenceStatus(),
     });
   }
 
@@ -772,6 +1134,8 @@ ${wdRows}
       githubWebhook: Boolean(GITHUB_WEBHOOK_SECRET),
       digest: { enabled: DIGEST_ENABLED, time: DIGEST_TIME, lastDigestDate },
       watchdog: readWatchdogHeartbeat(),
+      deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
+      presence: presenceStatus(),
     });
   }
 
@@ -799,6 +1163,7 @@ ${wdRows}
     try {
       task = normalizeTask({ assignee: body.get('assignee'), status: body.get('status') });
     } catch (e) { res.writeHead(400); return res.end(e.message); }
+    recordHeartbeat(sender);
     const msg = addMessage({ sender, text, source: 'web', task });
     console.log(`[mailbox] #${msg.id} ${sender}: ${text.slice(0, 80)}`);
     // Forward to Telegram so Martin sees it there too (fire-and-forget).
@@ -818,6 +1183,7 @@ ${wdRows}
   // SSE live stream: GET /api/events?token=...
   if (p === '/api/events' && req.method === 'GET') {
     if (!requireToken()) return;
+    recordHeartbeat(url.searchParams.get('sender') || '');
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
@@ -832,6 +1198,7 @@ ${wdRows}
 
   if (p === '/api/messages' && req.method === 'GET') {
     if (!requireToken()) return;
+    recordHeartbeat(url.searchParams.get('sender') || '');
     const limitRaw = Number(url.searchParams.get('limit') || 100);
     const limit = Math.min(Math.max(limitRaw || 100, 1), 500);
     const list = filterMessages(url);
@@ -890,6 +1257,59 @@ ${wdRows}
     return json(res, 200, { ok: true, posted: true, message: r.message });
   }
 
+  // Auto-deploy webhook (v1.4.0): POST /webhook/github — endpoint deploy
+  // riêng; /api/github-webhook (v1.3.0) cũng tự deploy khi push/PR-merge
+  // vào main, nên Martin chỉ cần cấu hình 1 trong 2 URL.
+  if (p === '/webhook/github' && req.method === 'POST') {
+    return handleDeployWebhook(req, res);
+  }
+
+  // Auto-deploy status (v1.4.0): GET /api/deploy?token=...
+  if (p === '/api/deploy' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, repoDir: REPO_DIR, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult } });
+  }
+
+  // Presence (v1.4.0): GET /api/presence?token=... — lần check-in cuối
+  // của từng Muse.
+  if (p === '/api/presence' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, presence: presenceStatus() });
+  }
+
+  // Catch-up digest (v1.4.0): GET /api/catchup?token=&sender=muse-a&since=12
+  // — tóm tắt các tin sau since mà sender chưa đọc. Khác với
+  // GET /api/digest của v1.3.0 (xem trước digest sáng theo giờ).
+  if (p === '/api/catchup' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const sender = url.searchParams.get('sender') || '';
+    const since = Number(url.searchParams.get('since') || 0);
+    const d = buildCatchupDigest(sender, since);
+    return json(res, 200, { ok: true, sender, since, ...d });
+  }
+
+  // Heartbeat + catch-up (v1.4.0): POST /api/heartbeat {"token","sender",
+  // "lastSeenId"} — ghi check-in; nếu Muse quay lại sau hơn
+  // PRESENCE_DIGEST_MINUTES phút thì trả kèm digest các tin chưa đọc.
+  if (p === '/api/heartbeat' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    if (!MUSES.includes(data.sender)) {
+      return json(res, 400, { ok: false, error: 'sender must be muse-a|muse-b|muse-c' });
+    }
+    const hb = recordHeartbeat(data.sender);
+    const since = Number(data.lastSeenId || 0);
+    const awayMs = hb?.prev?.lastSeen ? Date.now() - new Date(hb.prev.lastSeen).getTime() : 0;
+    const digest = awayMs > PRESENCE_DIGEST_MS ? buildCatchupDigest(data.sender, since) : null;
+    return json(res, 200, { ok: true, presence: presenceStatus(), wasOffline: hb?.wasOffline || false, digest });
+  }
+
   // GitHub webhook (v1.3.0): POST /api/github-webhook — xem
   // handleGitHubWebhook ở trên. Không dùng token của board, dùng chữ ký
   // HMAC với GITHUB_WEBHOOK_SECRET.
@@ -915,6 +1335,7 @@ ${wdRows}
     } catch (e) {
       return json(res, 400, { ok: false, error: e.message });
     }
+    recordHeartbeat(data.sender);
     const msg = addMessage({ sender: data.sender, text: String(data.text).trim(), source: 'api', task });
     forwardToTelegram(msg);
     return json(res, 200, { ok: true, message: msg });
@@ -966,9 +1387,14 @@ server.listen(PORT, HOST, () => {
   console.log(`Health: http://${HOST}:${PORT}/health`);
   console.log(`Status: http://${HOST}:${PORT}/status`);
   console.log(`GitHub webhook: ${GITHUB_WEBHOOK_SECRET ? `BẬT — POST /api/github-webhook (repos: ${GITHUB_WEBHOOK_REPOS.join(', ')})` : 'TẮT — chưa đặt GITHUB_WEBHOOK_SECRET'}`);
+  console.log(`Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? `BẬT — nhánh ${DEPLOY_BRANCH}, repo ${REPO_DIR}` : 'TẮT — chưa đặt GITHUB_WEBHOOK_SECRET hoặc AUTO_DEPLOY_ENABLED=0'}`);
+  console.log(`Presence: offline sau ${PRESENCE_OFFLINE_MINUTES} phút, digest khi quay lại sau ${PRESENCE_DIGEST_MINUTES} phút`);
+  console.log(`Telegram commands: ${TELEGRAM_COMMANDS_ENABLED ? 'BẬT' : 'TẮT'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
   setInterval(checkDigestDue, 60_000);
   checkDigestDue();
+  // Presence offline: kiểm tra mỗi phút (xem checkPresenceOffline).
+  setInterval(checkPresenceOffline, 60_000);
 });
