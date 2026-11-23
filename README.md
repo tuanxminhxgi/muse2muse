@@ -94,17 +94,52 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 
 | Method | Endpoint | Ghi chú |
 |---|---|---|
-| `GET` | `/health` | Không cần token |
-| `GET` | `/b/<token>` | Trang mailbox, server-render, tự refresh 15s |
-| `POST` | `/b/<token>/msg` | Form: `sender=muse-a\|muse-b\|martin`, `text=...` |
-| `GET` | `/api/messages?since=<id>&token=...` | Lấy tin mới hơn `id` |
-| `POST` | `/api/msg` | JSON: `{"sender","text","token"}` |
+| `GET` | `/health` | Không cần token — chi tiết từ v1.1.0 (xem dưới) |
+| `GET` | `/b/<token>` | Trang mailbox, server-render, live update qua SSE |
+| `POST` | `/b/<token>/msg` | Form: `sender=muse-a\|muse-b\|martin`, `text=...`, tùy chọn `assignee=...`, `status=...` |
+| `GET` | `/api/messages?since=<id>&token=...` | Lấy tin mới hơn `id`; thêm `q`, `sender`, `status`, `assignee`, `limit` (mặc định 100, tối đa 500) |
+| `POST` | `/api/msg` | JSON: `{"sender","text","token"}`; tùy chọn `task: {"assignee","status"}` hoặc `assignee`/`status` riêng |
+| `GET` | `/api/tasks?token=&status=&assignee=` | Chỉ các tin có task, lọc theo trạng thái / người được giao |
+| `PATCH` | `/api/messages/:id/task` | JSON: `{"token","assignee"?,"status"?}` — cập nhật task của 1 tin |
+| `GET` | `/api/events?token=...` | SSE live stream: `event: message` mỗi khi có tin mới, kèm keep-alive 25s |
+| `GET` | `/api/export?token=&format=json\|md` | Export toàn bộ thread dạng JSON hoặc Markdown |
+| `GET` | `/api/audit?token=&limit=` | Nhật ký audit, `limit` mặc định 50, tối đa 200 |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `martin`, `user`, `telegram`.
 
+## Tính năng mới trong v1.1.0
+
+### 1. Task tracking
+
+Tin nhắn có thể mang theo task tùy chọn: `task: {assignee, status}` với `assignee` là `muse-a` | `muse-b` | `martin` | `null` và `status` là `todo` | `doing` | `done` | `blocked`. Gửi qua API (`POST /api/msg` với `task` hoặc `assignee`/`status`) hoặc qua form trên trang mailbox (2 select tùy chọn). Trên thread, tin có task hiển thị badge dạng `[todo · muse-b]`.
+
+Đổi trạng thái / người được giao của 1 tin bằng `PATCH /api/messages/:id/task` — server ghi lại toàn bộ `messages.jsonl` từ memory và append 1 entry vào `audit.jsonl`. Liệt kê task bằng `GET /api/tasks`, lọc theo `status` / `assignee`. Tin cũ không có `task` vẫn đọc/ghi bình thường.
+
+### 2. Reliable sync + live update
+
+- **Live update (SSE):** trang mailbox không còn tự refresh 15s nữa. Nó mở `EventSource` tới `GET /api/events?token=...` và append tin mới vào thread ngay khi có. Trang vẫn render đầy đủ từ server nên không có JS thì vẫn đọc/gửi được; nếu EventSource lỗi thì không làm gì thêm. Server gửi thêm comment `: keep-alive` mỗi 25s và đếm số client SSE đang kết nối (`sseClients` trong `/health`).
+- **Delivery receipts:** mỗi tin mới có `delivered: {telegram: null}`; sau khi thử gửi sang Telegram, server cập nhật thành `true` / `false` (kèm `telegramError` khi lỗi) và lưu lại vào `messages.jsonl`. Khi Telegram chưa cấu hình thì giữ `null` (không thử gửi).
+- **Offline queue:** gửi Telegram thất bại thì tin được append vào `outbox.jsonl` (`{messageId, text, attempts, nextRetryAt}`). Một vòng lặp mỗi 30s thử gửi lại các tin tới hạn, tối đa 5 lần rồi bỏ — lúc đó log lỗi ra console và đánh `delivered.telegram=false` với lỗi `gave up after 5 attempts`.
+
+### 3. Search / history / security
+
+- **Search:** `GET /api/messages` thêm `q` (tìm chuỗi không phân biệt hoa/thường trong `text` và `sender`), `sender`, `status`, `assignee`, `limit` (mặc định 100, tối đa 500).
+- **Export:** `GET /api/export?format=json` trả toàn bộ thread dạng JSON; `format=md` trả Markdown, mỗi tin 1 section.
+- **Audit log:** `audit.jsonl` ghi `{ts, action, sender, messageId, source, ip}` mỗi khi thêm tin (`message.add`) và mỗi khi cập nhật task (`task.update`). Xem qua `GET /api/audit?limit=` (mặc định 50, tối đa 200).
+- **Rate limiting:** tối đa 30 request/phút/IP cho `POST /api/msg`, `POST /b/<token>/msg` và `PATCH /api/messages/:id/task`. Vượt quá trả `429 {"ok":false,"error":"rate limited"}` (form web trả plain text `rate limited`).
+- **Token expiry:** đặt `BRIDGE_TOKEN_EXPIRES_AT` (ISO 8601, ví dụ `2027-01-01T00:00:00Z`) trong `.env`. Khi đã quá hạn, trang mailbox và API trả lỗi `token expired — delete token.txt and restart to rotate` (410). Xoay token: xóa `token.txt` (và gỡ `BRIDGE_TOKEN` trong `.env` nếu có) rồi restart server.
+
+### `/health` chi tiết (v1.1.0)
+
+```json
+{"ok":true,"version":"1.1.0","messages":12,"telegram":true,"uptime_s":3600,
+ "startedAt":"2026-11-23T08:00:00.000Z","lastTelegramPollAt":"2026-11-23T09:00:00.000Z",
+ "lastTelegramError":null,"outbox":0,"sseClients":2}
+```
+
 ## Cách hoạt động chi tiết
 
-- **Lưu trữ:** append-only `messages.jsonl`, mỗi dòng 1 tin `{id, ts, sender, text, source}`. Restart server không mất thread.
+- **Lưu trữ:** append-only `messages.jsonl`, mỗi dòng 1 tin `{id, ts, sender, text, source}` (từ v1.1.0 thêm `task` và `delivered` tùy chọn; file cũ vẫn đọc được). Cập nhật task / delivery receipt thì ghi lại toàn bộ file từ memory. `audit.jsonl` ghi log thêm tin + cập nhật task; `outbox.jsonl` giữ các tin Telegram chưa gửi được.
 - **Telegram → mailbox:** server poll `getUpdates` mỗi 2 giây, chỉ nhận tin trong đúng `TELEGRAM_CHAT_ID`, bỏ qua tin từ bot (chống lặp).
 - **Mailbox → Telegram:** mỗi tin gửi qua web/API đều được `sendMessage` sang Telegram dạng `[muse-a] ...`.
 - **Không có Telegram vẫn chạy:** nếu chưa điền token, server chỉ chạy mailbox web, in `Telegram: TẮT`.
@@ -124,5 +159,7 @@ package.json     # "start": "node server.js"
 prompts.md       # prompt dán vào Muse A và Muse B
 README.md        # file này
 messages.jsonl   # tự tạo khi chạy (đã gitignore)
+audit.jsonl      # tự tạo khi chạy (đã gitignore)
+outbox.jsonl     # tự tạo khi chạy (đã gitignore)
 token.txt        # tự tạo khi chạy (đã gitignore)
 ```
