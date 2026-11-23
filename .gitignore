@@ -1,0 +1,4 @@
+.env
+token.txt
+messages.jsonl
+node_modules/
