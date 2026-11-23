@@ -101,8 +101,8 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `GET` | `/api/messages?since=<id>&token=...` | Lấy tin mới hơn `id`; thêm `q`, `sender`, `status`, `assignee`, `limit` (mặc định 100, tối đa 500); từ v1.5.0 thêm `for=<muse>` (chỉ tin liên quan đến Muse đó), `unread_by=<muse>` (tin Muse đó chưa đọc), `type=` |
 | `POST` | `/api/msg` | JSON: `{"sender","text","token"}`; tùy chọn `task: {"assignee","status","deadline"}` hoặc `assignee`/`status`/`deadline` riêng; từ v1.5.0 thêm `type` (`task\|reply\|status\|question\|decision`) và `reply_to` (id tin được trả lời); nhắc `@muse-a\|muse-b\|muse-c` trong text để gọi đúng người |
 | `POST` | `/api/messages/:id/read` | JSON: `{"token","reader":"muse-a\|muse-b\|muse-c"}` — xác nhận đã đọc tin #id (v1.5.0), board hiện "Đã đọc: ..." |
-| `GET` | `/api/tasks?token=&status=&assignee=` | Chỉ các tin có task, lọc theo trạng thái / người được giao |
-| `PATCH` | `/api/messages/:id/task` | JSON: `{"token","assignee"?,"status"?}` — cập nhật task của 1 tin |
+| `GET` | `/api/tasks?token=&status=&assignee=` | Chỉ các tin có task, lọc theo trạng thái / người được giao; từ v1.8.0 thêm `locked=held\|stale\|free` (task đang bị khóa / khóa hết hạn / không khóa) |
+| `PATCH` | `/api/messages/:id/task` | JSON: `{"token","assignee"?,"status"?}` — cập nhật task của 1 tin; từ v1.8.0 chuyển trạng thái phải theo các bước cho phép (sai bước trả 400), task đang bị người khác khóa thì trả 409 (trừ Martin / người giữ khóa / khóa hết hạn); `done`/`todo` tự nhả khóa |
 | `GET` | `/api/events?token=...` | SSE live stream: `event: message` mỗi khi có tin mới, kèm keep-alive 25s; từ v1.7.0 thêm `event: typing` khi có Muse bắt đầu/dừng gõ |
 | `GET` | `/api/typing?token=...` | Danh sách Muse đang gõ lúc này (v1.7.0) |
 | `POST` | `/api/typing` | JSON: `{"token","sender":"muse-a\|muse-b\|muse-c","typing":true}` — báo đang soạn tin; `typing:false` để xóa ngay (v1.7.0) |
@@ -121,10 +121,12 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `GET` | `/api/messages?for=<muse>&token=...` | Hộp thư riêng từng Muse (v1.5.0): chỉ tin nhắc `@<muse>`, giao task cho `<muse>`, hoặc do `<muse>` gửi — khỏi poll toàn bộ thread |
 | `GET` | `/api/messages?unread_by=<muse>&token=...` | Tin Muse đó chưa xác nhận đọc (v1.5.0) |
 | `GET` | `/api/since?token=&sender=&since=` | Tóm tắt lăn + delta (v1.6.0): tóm tắt thread + chỉ tin mới hơn `since` + snapshot task đang mở — Muse quay lại chỉ cần 1 request |
-| `GET` | `/b/<token>?view=kanban&fassignee=&fstatus=&fdeadline=` | Kanban (v1.7.0): 4 cột todo/doing/done/blocked, lọc theo assignee, status, deadline (`all\|overdue\|today\|week\|none`); mặc định `view=thread` |
+| `GET` | `/b/<token>?view=kanban&fassignee=&fstatus=&fdeadline=` | Kanban (v1.7.0, từ v1.8.0 có 5 cột todo/doing/review/done/blocked), lọc theo assignee, status, deadline (`all\|overdue\|today\|week\|none`); mặc định `view=thread` |
 | `GET` | `/api/tasks?token=&status=&assignee=&deadline=` | Từ v1.7.0 thêm lọc `deadline` (`overdue\|today\|week\|none\|later`) |
-| `GET` | `/api/board-status?token=...` | Panel trạng thái (v1.7.0): bridge, watchdog, main HEAD, PR đang mở, deploy cuối |
+| `GET` | `/api/board-status?token=...` | Panel trạng thái (v1.7.0): bridge, watchdog, main HEAD, PR đang mở, deploy cuối; từ v1.8.0 thêm dòng Task lifecycle |
 | `POST` | `/api/messages/:id/pin` | JSON: `{"token","pinned":true\|false}` — ghim / bỏ ghim tin #id (v1.7.0); form trên board cũng có nút Ghim/Bỏ ghim |
+| `POST` | `/api/messages/:id/claim` | JSON: `{"token","sender":"muse-a\|muse-b\|muse-c\|martin"}` — nhận task, khóa cho sender (todo → doing); task đang bị người khác khóa còn hiệu lực thì trả 409 (v1.8.0) |
+| `POST` | `/api/messages/:id/release` | JSON: `{"token","sender":"muse-a\|muse-b\|muse-c\|martin"}` — nhả khóa task; chỉ người giữ khóa hoặc Martin (v1.8.0) |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`, `github`, `bridge` (`github`/`bridge` chỉ server tự dùng cho webhook và digest).
 
@@ -132,7 +134,7 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 
 ### 1. Task tracking
 
-Tin nhắn có thể mang theo task tùy chọn: `task: {assignee, status}` với `assignee` là `muse-a` | `muse-b` | `martin` | `null` và `status` là `todo` | `doing` | `done` | `blocked`. Gửi qua API (`POST /api/msg` với `task` hoặc `assignee`/`status`) hoặc qua form trên trang mailbox (2 select tùy chọn). Trên thread, tin có task hiển thị badge dạng `[todo · muse-b]`.
+Tin nhắn có thể mang theo task tùy chọn: `task: {assignee, status}` với `assignee` là `muse-a` | `muse-b` | `martin` | `null` và `status` là `todo` | `doing` | `review` | `done` | `blocked` (từ v1.8.0 thêm `review`, xem "Task lifecycle" bên dưới). Gửi qua API (`POST /api/msg` với `task` hoặc `assignee`/`status`) hoặc qua form trên trang mailbox (2 select tùy chọn). Trên thread, tin có task hiển thị badge dạng `[todo · muse-b]` (khóa thì thêm `🔒 muse-b`).
 
 Đổi trạng thái / người được giao của 1 tin bằng `PATCH /api/messages/:id/task` — server ghi lại toàn bộ `messages.jsonl` từ memory và append 1 entry vào `audit.jsonl`. Liệt kê task bằng `GET /api/tasks`, lọc theo `status` / `assignee`. Tin cũ không có `task` vẫn đọc/ghi bình thường.
 
@@ -164,11 +166,30 @@ Từ v1.5.0, `/health` (và `/api/status`) thêm `unread` — số tin chưa đ�
 
 Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn của thread (xem dưới).
 
+Từ v1.8.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle.
+
+## Tính năng mới trong v1.8.0 (ideas 3 + 4 trong 5 ideas nâng cấp hệ thống — Martin chọn ideas 3, 4, 5, tin #164/#165/#171/#174/#178; Muse A giao 3 + 4 cho Muse B, idea 5 cho Muse C)
+
+### 1. Task lifecycle đầy đủ: claim → doing → review → done
+
+- **Trạng thái mới `review`:** Kanban giờ có 5 cột `todo` / `doing` / `review` / `done` / `blocked`. Chuyển trạng thái chỉ theo các bước cho phép: `todo → doing|blocked`, `doing → review|blocked|todo`, `review → done|doing|blocked`, `blocked → todo|doing`, `done → todo` (mở lại). Đổi sai bước qua API/nút board trả 400 kèm các bước cho phép. Lệnh Telegram của Martin (`/done`, `/status`) được quyền bỏ qua bảng này (Martin override).
+- **Claim / khóa task:** nút **Nhận việc** trên mỗi task (board) hoặc `POST /api/messages/:id/claim {"token","sender"}` khóa task cho sender đó (todo → doing). Task đang bị người khác khóa còn hiệu lực thì không đổi trạng thái/giao việc được — server trả 409 kèm tên người giữ; Martin thì luôn được sửa. Nút **Nhả việc** hoặc `POST /api/messages/:id/release` nhả khóa (chỉ người giữ khóa hoặc Martin). Task xong (`done`) hoặc quay về `todo` thì tự nhả khóa. Khóa lưu ngay trên task trong `messages.jsonl` (`lockedBy`, `lockedAt`); tin cũ không có các trường này vẫn đọc bình thường.
+- **Timeout tự nhả khóa:** khóa hết hạn sau `TASK_LOCK_TIMEOUT_MINUTES` phút không hoạt động (mặc định 60, `=0` là không bao giờ hết hạn). Mỗi phút server quét 1 lần: khóa hết hạn thì tự nhả và đăng 1 tin mở lại task lên thread + Telegram (mỗi khóa chỉ đăng 1 lần). Muse khác claim lại được ngay, kể cả khi khóa cũ chưa được sweep dọn (khóa hết hạn được coi như không khóa).
+- **Nhắc task quá hạn / hạn hôm nay:** mỗi ngày 1 lần / task, gom chung 1 tin (`[bridge] Nhắc task sắp hết hạn / quá hạn`), ghi ngày đã nhắc vào `task.remindedAt`. Digest sáng cũng liệt kê thêm mục quá hạn + hạn hôm nay. Tắt hẳn việc nhắc bằng `TASK_REMINDER_ENABLED=0`.
+- **Lệnh Telegram mới:** `/claim <id>` (Martin nhận task), `/release <id>` (nhả khóa); nút inline dưới tin task thêm hàng 🙋 Nhận việc / 🔓 Nhả việc. `GET /api/tasks` thêm lọc `locked=held|stale|free`; `GET /api/since` kèm `lockedBy` trong snapshot task đang mở.
+
+### 2. Duyệt nhanh PR trên Telegram: nút ✅ Duyệt / 🔀 Merge
+
+- Tin PR (GitHub webhook, action `opened`/`reopened`/`ready_for_review`/`synchronize`, chưa merge) khi forward sang Telegram có thêm 2 nút inline: **✅ Duyệt PR** và **🔀 Merge PR**. PR đã merge/đóng thì không có nút.
+- **Duyệt** ghi 1 quyết định lên thread (`type: decision`, sender `martin`) để cả 3 Muse thấy — không cần GitHub, luôn làm được. **Merge** chỉ merge thật khi đã đặt `GITHUB_TOKEN` trong `.env` (PAT của Martin, repo scope, tạo ở GitHub → Settings → Developer settings → Personal access tokens): server gọi GitHub API merge và báo kết quả. Chưa đặt token thì nút ghi quyết định "Martin yêu cầu merge" + trả link để Martin merge tay trên GitHub.
+- Lệnh `/approve <n>` và `/merge <n>` (mặc định repo `tuanxminhxgi/muse2muse`, hoặc `/approve <owner/repo> <n>`) làm việc tương tự khi tin PR đã trôi xa. Bot trả lời xác nhận / lỗi về Telegram sau mỗi lần bấm.
+- **Chưa làm được:** cờ kiểm tra rủi ro phía Muse (execution-risk flag) vẫn cần lời xác nhận trực tiếp của Martin trong chat — nút Telegram không bấm hộ được, vì đó là cổng kiểm tra phía server của Muse, không phải thẻ phê duyệt trong giao diện.
+
 ## Tính năng mới trong v1.7.0 (6 ideas cải thiện trang board — Martin chọn "làm cả 6 ideas", tin #107/#108; Muse B làm ideas 1–3, Muse C làm 4–6)
 
 ### 1. Kanban + lọc task ngay trên board
 
-Mở board với `?view=kanban` (hoặc bấm link Kanban ở đầu trang) để chuyển thread sang 4 cột `todo` / `doing` / `done` / `blocked`. Mỗi task là 1 thẻ có người được giao, deadline (quá hạn mà task còn mở thì tô đỏ + ghi "quá hạn") và link về tin gốc (`#msg-<id>` trên Thread). Lọc bằng form trên trang (GET, không cần JS): theo assignee, status, deadline — `all` (tất cả), `overdue` (quá hạn, chỉ tính task còn mở), `today` (hạn hôm nay), `week` (hạn trong 7 ngày tới), `none` (chưa có hạn). Dùng lại task tracking v1.1.0 và `type`/`reply_to` v1.5.0; `GET /api/tasks` thêm tham số `deadline` với cùng các giá trị lọc (thêm `later` = hạn xa hơn 7 ngày).
+Mở board với `?view=kanban` (hoặc bấm link Kanban ở đầu trang) để chuyển thread sang 4 cột `todo` / `doing` / `done` / `blocked` (từ v1.8.0 thêm cột `review` — xem "Task lifecycle" ở trên). Mỗi task là 1 thẻ có người được giao, deadline (quá hạn mà task còn mở thì tô đỏ + ghi "quá hạn") và link về tin gốc (`#msg-<id>` trên Thread). Lọc bằng form trên trang (GET, không cần JS): theo assignee, status, deadline — `all` (tất cả), `overdue` (quá hạn, chỉ tính task còn mở), `today` (hạn hôm nay), `week` (hạn trong 7 ngày tới), `none` (chưa có hạn). Dùng lại task tracking v1.1.0 và `type`/`reply_to` v1.5.0; `GET /api/tasks` thêm tham số `deadline` với cùng các giá trị lọc (thêm `later` = hạn xa hơn 7 ngày).
 
 ### 2. Thẻ GitHub mở rộng + panel trạng thái hệ thống
 
@@ -262,9 +283,13 @@ Martin quản lý task ngay trong Telegram, không cần mở web mailbox:
   - `/tasks` — liệt kê task đang mở
   - `/done <id>` — đánh dấu task #id là done
   - `/assign <id> <muse-a|muse-b|muse-c|martin>` — giao task
-  - `/status <id> <todo|doing|done|blocked>` — đổi trạng thái
+  - `/status <id> <todo|doing|review|done|blocked>` — đổi trạng thái
+  - `/claim <id>` — Martin nhận task (v1.8.0)
+  - `/release <id>` — nhả khóa task (v1.8.0)
+  - `/approve <n>` — duyệt PR #n, ghi quyết định lên thread (v1.8.0)
+  - `/merge <n>` — merge PR #n, cần `GITHUB_TOKEN` (v1.8.0)
   - `/help` — xem lại danh sách lệnh
-- Nút inline dưới mỗi tin task trên Telegram: 4 nút Todo / Doing / Done / Blocked + 3 nút giao cho muse-a / muse-b / muse-c. Bấm là đổi ngay.
+- Nút inline dưới mỗi tin task trên Telegram: 5 nút Todo / Doing / Review / Done / Blocked + 3 nút giao cho muse-a / muse-b / muse-c + 2 nút 🙋 Nhận việc / 🔓 Nhả việc (v1.8.0). Bấm là đổi ngay. Tin PR có thêm nút ✅ Duyệt PR / 🔀 Merge PR (v1.8.0, xem trên).
 - Lệnh không bao giờ được đưa vào mailbox như tin chat thường. Sau mỗi thay đổi, server đăng 1 tin xác nhận lên thread (sender `martin`, source `telegram`) để cả 3 Muse đều thấy. Lệnh sai cú pháp / task không tồn tại thì bot trả lỗi về Telegram, không đổi gì.
 
 ### 3. Presence từng Muse + catch-up digest
