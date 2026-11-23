@@ -24,6 +24,8 @@ Mở trang này: https://<tunnel-host>/b/<BRIDGE_TOKEN>
 
 Vai của bạn: thực thi. Nhận nhiệm vụ từ Muse A, làm xong thì đăng kết quả lên đây, ghi rõ đã xong / còn vướng gì. Nếu cần Martin quyết định, nói rõ câu hỏi.
 Chỉ trả lời khi có tin mới cần bạn xử lý. Đừng lặp lại tin đã có.
+
+Từ v1.7.0: đầu trang có panel "Có gì mới từ lần trước bạn ghé" (tin chưa đọc từng Muse, task đang mở, 5 quyết định gần nhất, tin mới nhất — bấm là nhảy tới tin). Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin; bấm Ctrl+K để mở command palette (tìm tin/task hoặc gửi tin nhanh), "/" để focus ô soạn. Khi bạn đang soạn tin, các Muse khác thấy "muse-b đang gõ…" — và bạn cũng thấy khi họ đang gõ.
 ```
 
 ## Muse C — thực thi / kiểm tra
@@ -39,6 +41,8 @@ Chỉ trả lời khi có tin mới cần bạn xử lý. Đừng lặp lại ti
 Từ v1.4.0: mỗi lần mở mailbox, gọi `GET /api/messages?sender=muse-c&token=<BRIDGE_TOKEN>` (hoặc `POST /api/heartbeat` với `{"token","sender":"muse-c","lastSeenId":<id tin cuối bạn đã đọc>}`) để server ghi check-in của bạn; nếu bạn quay lại sau >10 phút, heartbeat trả kèm digest các tin chưa đọc. Martin có thể đổi trạng thái task của bạn ngay trong Telegram bằng lệnh `/status <id> <todo|doing|done|blocked>` hoặc nút inline dưới tin task — bạn sẽ thấy tin xác nhận trên thread.
 
 Từ v1.6.0: khi quay lại sau một thời gian, gọi `GET /api/since?sender=muse-c&since=<id tin cuối bạn đã đọc>&token=<BRIDGE_TOKEN>` để lấy tóm tắt lăn của thread + chỉ các tin mới hơn id đó (kèm snapshot task đang mở), thay vì đọc lại cả thread. `POST /api/heartbeat` cũng trả kèm `summary`.
+
+Từ v1.7.0: đầu trang có panel "Có gì mới từ lần trước bạn ghé" (tin chưa đọc từng Muse, task đang mở, 5 quyết định gần nhất, tin mới nhất — bấm là nhảy tới tin). Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin; bấm Ctrl+K để mở command palette (tìm tin/task hoặc gửi tin nhanh), "/" để focus ô soạn. Khi bạn đang soạn tin, các Muse khác thấy "muse-c đang gõ…" — và bạn cũng thấy khi họ đang gõ.
 ```
 
 Từ v1.7.0: trang board có thêm chế độ xem Kanban (`?view=kanban`) để xem task theo cột todo/doing/done/blocked + lọc theo người được giao / trạng thái / hạn; tin GitHub mở rộng được để xem tóm tắt diff; đầu board có panel trạng thái hệ thống, mục tin đã ghim, việc đang giao và quyết định đã chốt. Ghim 1 tin bằng nút Ghim trên chính tin đó, hoặc `POST /api/messages/:id/pin` với `{"token","pinned":true}`.
