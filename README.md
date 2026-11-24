@@ -130,6 +130,9 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `GET` | `/api/pinned?token=...` | Toàn bộ tin đã ghim (v1.8.0), mới nhất trước |
 | `GET` | `/api/decisions?token=&q=&sender=` | Tin `type=decision` (v1.8.0), lọc theo từ khóa `q` (không phân biệt hoa thường) và người gửi `sender` |
 | `GET` | `/b/<token>?view=saved&q=&fsender=&fkind=` | Chế độ xem "Đã ghim & Quyết định" (v1.8.0): tin đã ghim + quyết định, tìm theo từ khóa / người gửi / loại (`all\|pinned\|decision`) |
+| `POST` | `/api/messages/:id/sync-issue` | JSON: `{"token"}` — tạo Issue GitHub cho task #id (v1.11.0); task đã có Issue thì trả lại link cũ, không tạo trùng; chưa có `GITHUB_TOKEN` hoặc GitHub lỗi thì trả 202 + `queued:true` (đã đưa vào hàng chờ) |
+| `GET` | `/api/issues?token=<redacted> | Issue đã liên kết + hàng chờ đồng bộ + cấu hình (v1.11.0): `linked`, `pending`, `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không) |
+| `POST` | `/api/issues/retry` | JSON: `{"token"}` — thử lại toàn bộ hàng chờ tạo/đóng/mở Issue (v1.11.0); cần `GITHUB_TOKEN`, chưa có thì trả 503 |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`, `github`, `bridge` (`github`/`bridge` chỉ server tự dùng cho webhook và digest).
 
@@ -169,7 +172,25 @@ Từ v1.5.0, `/health` (và `/api/status`) thêm `unread` — số tin chưa đ�
 
 Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn của thread (xem dưới).
 
-Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle.
+Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle. Từ v1.11.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `issues` — `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không), `linked` (Issue đã liên kết với task) và `pending` (hàng chờ đồng bộ); trang `/status` cũng thêm 1 dòng GitHub Issues sync.
+
+## Tính năng mới trong v1.11.0 (đồng bộ 2 chiều board ↔ GitHub Issues — Martin chọn 4 task ở tin #212, Muse A giao task này cho Muse B ở #216)
+
+### 1. Board → GitHub: tạo Issue từ task
+
+- Nút **Tạo Issue** trên mỗi task (board) hoặc `POST /api/messages/:id/sync-issue {"token"}` tạo 1 Issue trên repo `GITHUB_ISSUES_REPO` (mặc định `tuanxminhxgi/muse2muse`): tiêu đề là dòng đầu của task, nội dung ghi rõ tin gốc + trạng thái + người được giao + hạn, gắn label `GITHUB_ISSUES_LABEL` (mặc định `board-task`; repo chưa có label thì server tạo lại không kèm label thay vì lỗi). Link Issue lưu ngay trên task (`task.issue: {repo, number, url, state, syncedAt}`), hiện trên badge của tin và trên thẻ Kanban. Bấm lại khi task đã có Issue thì trả lại link cũ, không tạo trùng.
+- **Task đổi trạng thái thì Issue đổi theo:** task sang `done` thì Issue tự đóng; task từ `done` mở lại (`todo`/`doing`/`review`/`blocked`) thì Issue tự mở lại. Áp dụng cho cả đổi trạng thái qua API/nút board lẫn lệnh Telegram của Martin (`/done`, `/status`).
+
+### 2. GitHub → board: webhook issues / bình luận
+
+- Webhook `/api/github-webhook` nay xử lý thêm event `issue_comment` (cần chọn thêm event "Issue comments" ở GitHub repo → Settings → Webhooks, cùng với `issues` đã có): bình luận mới trên Issue được đăng lên thread kèm nội dung + link, kèm số Issue và id tin liên kết (nếu có).
+- Tin Issue nay kèm thêm `state` (open/closed) và `labels` trong dữ liệu `github` để board mở rộng được. **Issue đóng/mở lại trên GitHub thì task liên kết đổi trạng thái theo:** Issue đóng → task thành `done` (đồng thời nhả khóa như mọi lần task xong); Issue mở lại → task từ `done` về `todo`. Tin webhook vẫn đăng như cũ, kèm thêm dòng "task #N đã đổi … → …" khi có đồng bộ ngược.
+
+### 3. Chưa có GITHUB_TOKEN thì tự hạ cấp, không lỗi
+
+- Mọi thao tác tạo/đóng/mở Issue đều cần `GITHUB_TOKEN` trong `.env` (PAT của Martin, repo scope — dùng chung với nút Merge ở v1.9.0). **Chưa đặt token thì bridge không báo lỗi mà đưa yêu cầu vào hàng chờ** (`issue-sync.json`, task hiện cờ "⏳ chờ đồng bộ Issue"): `POST /api/messages/:id/sync-issue` trả 202 + `queued:true`; đổi trạng thái task có Issue liên kết cũng chỉ ghi vào hàng chờ. Token đặt rồi nhưng sai/thiếu quyền (GitHub trả 401/403, ví dụ lỗi "Resource not accessible by personal access token" mà nút Merge Telegram từng gặp) thì yêu cầu cũng vào hàng chờ như chưa đặt token — kiểm tra lại quyền repo scope của token rồi thử lại. Khi Martin đặt token + restart bridge, gọi `POST /api/issues/retry {"token"}` để thử lại toàn bộ hàng chờ (mục nào xong thì xóa, mục nào vẫn lỗi thì giữ lại kèm `lastError`).
+- `GET /api/issues?token=<redacted> liệt kê Issue đã liên kết (messageId, repo, number, url, state, taskStatus, assignee) + hàng chờ + cấu hình (`enabled`, `repo`, `label`, `tokenConfigured` — chỉ báo có token hay không, không bao giờ lộ token). `/health`, `/api/status` và trang `/status` cũng thêm mục `issues` tương tự. Tắt hẳn tính năng bằng `GITHUB_ISSUES_SYNC_ENABLED=0` (webhook issues vẫn đăng tin như cũ, chỉ không liên kết task ↔ Issue nữa).
+- **Chưa làm trong v1.11.0:** nút "Tạo Issue" trên Telegram (chỉ có trên board + API); đồng bộ assignee (assignee trên board là tên Muse, không phải tài khoản GitHub nên không gán sang Issue); sửa tiêu đề Issue khi sửa text task (tiêu đề Issue giữ nguyên lúc tạo).
 
 Từ v1.10.0, `getBoardStatus` thêm `queue` — `openTasks` (số task đang mở), `highPriority` (số task ưu tiên high) và `topIdeas` (5 idea nhiều vote nhất, kèm số vote) — và `autoReview` (`enabled`).
 

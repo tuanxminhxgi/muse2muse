@@ -5,4 +5,6 @@ audit.jsonl
 outbox.jsonl
 digest-state.json
 watchdog.json
+issue-sync.json
+presence.json
 node_modules/
