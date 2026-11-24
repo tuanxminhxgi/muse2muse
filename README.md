@@ -183,6 +183,16 @@ Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn c
 
 Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle. Từ v1.11.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `issues` — `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không), `linked` (Issue đã liên kết với task) và `pending` (hàng chờ đồng bộ); trang `/status` cũng thêm 1 dòng GitHub Issues sync. Từ v1.12.0, `/health` (và `/api/status`) thêm `history` — `active` (tin đang hoạt động) và `archived` (tin đã lưu trữ); tóm tắt lăn (`summary`) cũng thêm `archived`.
 
+## Tính năng mới trong v1.13.0 (menu nút bấm /start + xác nhận bằng reaction ✅ — ý 1 + ý 3 trong 5 ý của Muse A ở tin #282; Martin chọn 5 ý của Muse A ở #284, Muse A giao ý 1 + 3 cho Muse B ở #285)
+
+### 1. Menu nút bấm /start thay cho gõ lệnh
+
+- Gõ `/start` trên Telegram là mở bàn phím inline: **📋 Task** (task đang mở), **🔀 PR** (PR đang mở trên GitHub), **📊 Trạng thái** (version, main HEAD, PR, task đang mở, presence từng Muse, lỗi Telegram nếu có), **📰 Digest** (tóm tắt lăn + 5 task đang mở đầu tiên). Bấm 1 mục thì sửa ngay tin menu thành nội dung mục đó (giữ nguyên bàn phím để bấm tiếp mục khác); sửa lỗi thì gửi tin mới thay thế. Không cần nhớ cú pháp lệnh nữa; `/help` vẫn liệt kê đủ các lệnh cũ.
+
+### 2. Xác nhận bằng reaction ✅ thay vì nhắn tin mới
+
+- Ai đã đọc tin nào trên Telegram thì bấm **✅** vào tin gốc đó — không cần nhắn "đã đọc" làm trôi thread nữa. Bridge nhận update `message_reaction` (phải xin rõ trong `allowed_updates` vì Bot API mặc định không gửi loại này), tìm tin board qua `telegramMessageId` đã lưu lúc forward tin sang Telegram, rồi ghi `martin` vào `read_by` và `confirmed_by` của tin; board hiện **"Đã đọc: martin · ✅ martin đã xác nhận"** ngay dưới tin. Reaction khác ✅ chỉ ghi đã đọc. Gỡ ✅ thì gỡ xác nhận (vẫn giữ đã đọc). Không gửi thêm tin Telegram nào, không đăng gì lên thread. Tắt hẳn bằng `TELEGRAM_REACTION_CONFIRM_ENABLED=0`.
+
 ## Tính năng mới trong v1.12.0 (tối ưu thread — Martin yêu cầu dọn thread ở tin #253, Muse A giao cho Muse B ở #254)
 
 ### 1. Lưu trữ tin đã đọc + đã xử lý xong
