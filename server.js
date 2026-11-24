@@ -237,6 +237,27 @@
 //      archive-read hàng loạt. Tóm tắt lăn, digest và các endpoint cũ
 //      giữ nguyên, tương thích ngược.
 //
+// v1.13.0 (Muse B: ý 1 + ý 3 trong 5 ý của Muse A ở tin #282 — Martin
+// chọn 5 ý của Muse A ở #284, Muse A giao ý 1 + 3 cho Muse B ở #285;
+// Martin xác nhận cho Muse B ở #289, rồi chọn "xác nhận bằng cách khác"
+// ở #298 khi cờ execution-risk vẫn chặn subagent chạy git):
+//   1) Menu nút bấm thay cho gõ lệnh: /start mở bàn phím inline (📋
+//      Task, 🔀 PR, 📊 Trạng thái, 📰 Digest) — bấm là xem, không cần
+//      nhớ cú pháp lệnh. Bấm 1 mục thì sửa ngay tin menu (editMessageText)
+//      thành nội dung mục đó, giữ nguyên bàn phím để bấm tiếp mục khác;
+//      sửa lỗi thì gửi tin mới thay thế. Dùng lại listOpenTasksText,
+//      getOpenPRs, getBoardStatus và buildRollingSummary đã có sẵn.
+//   2) Xác nhận bằng reaction ✅ thay vì nhắn tin mới: ai đã đọc tin
+//      nào trên Telegram thì bấm ✅ vào tin gốc đó — bridge nhận update
+//      message_reaction (cần allowed_updates gồm message_reaction vì
+//      Bot API mặc định không gửi loại này), tìm tin board qua
+//      telegramMessageId đã lưu lúc forward, ghi 'martin' vào read_by
+//      và confirmed_by của tin, hiện "✅ martin đã xác nhận" trên board.
+//      Reaction khác ✅ chỉ ghi đã đọc. Gỡ ✅ thì gỡ xác nhận (vẫn giữ
+//      đã đọc). Không gửi thêm tin Telegram nào, không đăng gì lên
+//      thread — đúng mục đích bớt tin trôi. Tắt hẳn bằng
+//      TELEGRAM_REACTION_CONFIRM_ENABLED=0.
+//
 // Ghi chú: lúc làm v1.11.0, nội dung repo lại bị gắn cờ execution-risk
 // (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
 // board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
@@ -254,7 +275,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.12.0';
+const VERSION = '1.13.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -310,6 +331,9 @@ const PRESENCE_OFFLINE_MINUTES = Number(process.env.PRESENCE_OFFLINE_MINUTES || 
 const PRESENCE_DIGEST_MINUTES = Number(process.env.PRESENCE_DIGEST_MINUTES || 10);
 // Lệnh Telegram quản lý task (v1.4.0): TELEGRAM_COMMANDS_ENABLED=0 tắt hẳn.
 const TELEGRAM_COMMANDS_ENABLED = (process.env.TELEGRAM_COMMANDS_ENABLED || 'true').toLowerCase() !== 'false';
+// Xác nhận bằng reaction ✅ (v1.13.0): TELEGRAM_REACTION_CONFIRM_ENABLED=0
+// tắt hẳn việc nhận message_reaction (khi đó ✅ không ghi gì lên board).
+const TELEGRAM_REACTION_CONFIRM_ENABLED = (process.env.TELEGRAM_REACTION_CONFIRM_ENABLED || 'true').toLowerCase() !== 'false';
 // Task lifecycle (v1.9.0): khóa task hết hạn sau TASK_LOCK_TIMEOUT_MINUTES
 // phút không hoạt động (0 = khóa không bao giờ hết hạn); nhắc task quá
 // hạn / hạn hôm nay mỗi ngày 1 lần, TASK_REMINDER_ENABLED=0 tắt hẳn.
@@ -504,8 +528,8 @@ async function checkPresenceOffline() {
 // ---------- Mailbox (append-only JSONL) ----------
 // messages.jsonl stays backward compatible: old plain
 // {id, ts, sender, text, source} lines load fine; new fields (task,
-// delivered, type, reply_to, mentions, read_by) are optional and simply
-// absent on old messages.
+// delivered, type, reply_to, mentions, read_by, telegramMessageId,
+// confirmed_by) are optional and simply absent on old messages.
 let messages = [];
 let nextId = 1;
 try {
@@ -782,8 +806,11 @@ setInterval(() => {
 }, 2000).unref();
 
 // ---------- Telegram ----------
-async function sendToTelegram(text, replyMarkup) {
-  if (!telegramEnabled) return false;
+// Gửi 1 tin sang Telegram, trả {ok, messageId} — messageId để
+// forwardToTelegram lưu telegramMessageId lên tin board (v1.13.0: tra
+// ngược tin board khi Martin bấm reaction ✅ trên Telegram).
+async function sendTelegramMessage(text, replyMarkup) {
+  if (!telegramEnabled) return { ok: false, messageId: null };
   try {
     const body = { chat_id: TELEGRAM_CHAT_ID, text };
     if (replyMarkup) body.reply_markup = replyMarkup;
@@ -795,13 +822,43 @@ async function sendToTelegram(text, replyMarkup) {
     if (!res.ok) {
       lastTelegramError = `sendMessage ${res.status}: ${(await res.text()).slice(0, 200)}`;
       console.error('[telegram] sendMessage failed:', lastTelegramError);
-    } else {
-      lastTelegramError = null;
+      return { ok: false, messageId: null };
     }
-    return res.ok;
+    lastTelegramError = null;
+    const data = await res.json().catch(() => ({}));
+    return { ok: true, messageId: data?.result?.message_id ?? null };
   } catch (e) {
     lastTelegramError = e.message;
     console.error('[telegram] sendMessage error:', e.message);
+    return { ok: false, messageId: null };
+  }
+}
+
+// Wrapper cũ (boolean) để mọi caller hiện tại không phải đổi.
+async function sendToTelegram(text, replyMarkup) {
+  const r = await sendTelegramMessage(text, replyMarkup);
+  return r.ok;
+}
+
+// Sửa nội dung tin đã gửi trên Telegram (v1.13.0: bấm menu thì sửa tin
+// menu tại chỗ thay vì gửi tin mới). Trả true khi sửa được.
+async function editTelegramMessage(chatId, messageId, text, replyMarkup) {
+  if (!telegramEnabled) return false;
+  try {
+    const body = { chat_id: chatId, message_id: messageId, text };
+    if (replyMarkup) body.reply_markup = replyMarkup;
+    const res = await fetch(tgApi('editMessageText'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      console.error('[telegram] editMessageText failed:', res.status, (await res.text()).slice(0, 200));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('[telegram] editMessageText error:', e.message);
     return false;
   }
 }
@@ -815,6 +872,7 @@ async function sendToTelegram(text, replyMarkup) {
 // /status <id> <todo|doing|done|blocked>; /help.
 const TASK_COMMANDS_HELP = [
   'Lệnh quản lý task:',
+  '/start — mở menu nút bấm (Task, PR, Trạng thái, Digest)',
   '/tasks — liệt kê task đang mở',
   '/done <id> — đánh dấu task #id là done',
   '/assign <id> <muse-a|muse-b|muse-c|martin> — giao task',
@@ -832,6 +890,7 @@ function parseTelegramCommand(text) {
   if (!trimmed.startsWith('/')) return null;
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0].split('@')[0].toLowerCase();
+  if (cmd === '/start' && parts.length === 1) return { cmd: 'start' };
   if (cmd === '/tasks' && parts.length === 1) return { cmd: 'tasks' };
   if (cmd === '/help' && parts.length === 1) return { cmd: 'help' };
   if (cmd === '/done' && parts.length === 2) {
@@ -871,7 +930,7 @@ function parseTelegramCommand(text) {
     if (!Number.isInteger(number) || number <= 0) return { cmd: 'bad', error: 'số PR phải là số, ví dụ /approve 11' };
     return { cmd: cmd.slice(1), repo, number };
   }
-  if (['/tasks', '/done', '/assign', '/status', '/claim', '/release', '/approve', '/merge', '/vote', '/help'].includes(cmd)) {
+  if (['/start', '/tasks', '/done', '/assign', '/status', '/claim', '/release', '/approve', '/merge', '/vote', '/help'].includes(cmd)) {
     return { cmd: 'bad', error: `sai cú pháp. Gõ /help để xem cách dùng.` };
   }
   return null; // lệnh lạ (không phải của bridge) — bỏ qua, không đưa vào mailbox
@@ -886,6 +945,62 @@ function listOpenTasksText() {
     lines.push(`#${m.id} [${m.task.status}] ${m.task.assignee || 'chưa giao'} — ${m.sender}: ${first}`);
   }
   return lines.join('\n');
+}
+
+// ---------- Menu nút bấm /start (v1.13.0, ý 1 của Muse A ở #282) ----------
+// /start mở bàn phím inline — bấm là xem, không cần nhớ cú pháp lệnh.
+// Bấm 1 mục thì sửa ngay tin menu thành nội dung mục đó (xem pollTelegram),
+// giữ nguyên bàn phím để bấm tiếp mục khác.
+const MENU_TEXT = 'Menu bridge — bấm 1 mục để xem:';
+const MENU_SECTIONS = ['main', 'tasks', 'prs', 'status', 'digest'];
+function menuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '📋 Task', callback_data: 'menu:tasks' },
+        { text: '🔀 PR', callback_data: 'menu:prs' },
+      ],
+      [
+        { text: '📊 Trạng thái', callback_data: 'menu:status' },
+        { text: '📰 Digest', callback_data: 'menu:digest' },
+      ],
+    ],
+  };
+}
+
+// Nội dung từng mục menu; dùng lại dữ liệu đã có sẵn (task, PR, board
+// status, tóm tắt lăn). Trả text thuần để sửa tin menu tại chỗ.
+async function buildMenuSectionText(section) {
+  if (section === 'tasks') return listOpenTasksText();
+  if (section === 'prs') {
+    const prs = await getOpenPRs();
+    if (!prs) return 'Không lấy được danh sách PR đang mở (GitHub API lỗi).';
+    if (prs.length === 0) return 'Không có PR nào đang mở.';
+    const lines = [`${prs.length} PR đang mở:`];
+    for (const pr of prs) lines.push(`#${pr.number} ${pr.title} — ${pr.author}\n${pr.url}`);
+    return lines.join('\n');
+  }
+  if (section === 'status') {
+    const s = await getBoardStatus();
+    const head = s.head ? String(s.head).slice(0, 7) : '—';
+    const prs = s.openPrs === null ? 'không lấy được' : s.openPrs.length === 0 ? 'không có' : s.openPrs.map((p) => `#${p.number}`).join(', ');
+    const presence = (s.presence || []).map((p) => `${p.muse} ${p.online ? 'online' : p.agoMinutes === null ? 'chưa check-in' : `${p.agoMinutes} phút trước`}`).join(' · ');
+    return [
+      `📊 Trạng thái bridge — v${s.version} · main ${head}`,
+      `PR đang mở: ${prs}`,
+      `Task đang mở: ${s.openTasks} · Tin: ${s.messages}`,
+      `Presence: ${presence}`,
+      s.lastTelegramError ? `⚠️ Lỗi Telegram: ${s.lastTelegramError}` : 'Telegram: OK',
+    ].join('\n');
+  }
+  if (section === 'digest') {
+    const sum = buildRollingSummary();
+    const open = openTasks().slice(0, 5);
+    const lines = [`📰 Digest — ${sum.text}`];
+    for (const m of open) lines.push(`#${m.id} [${m.task.status}] ${m.task.assignee || 'chưa giao'} — ${String(m.text).split('\n')[0].slice(0, 100)}`);
+    return lines.join('\n');
+  }
+  return MENU_TEXT;
 }
 
 // Nút inline dưới tin task trên Telegram: callback_data 'task:<id>:<status>'
@@ -933,6 +1048,9 @@ function mergeKeyboards(a, b) {
 
 function parseCallbackData(data) {
   const parts = String(data || '').split(':');
+  if (parts[0] === 'menu' && parts.length === 2 && MENU_SECTIONS.includes(parts[1])) {
+    return { kind: 'menu', section: parts[1] };
+  }
   if (parts[0] === 'task' && parts.length === 3 && TASK_STATUSES.includes(parts[2])) {
     const id = Number(parts[1]);
     if (Number.isInteger(id) && id > 0) return { kind: 'task', id, status: parts[2] };
@@ -987,9 +1105,11 @@ function applyTaskUpdate({ id, status, assignee }, opts = {}) {
 
 // Xử lý 1 lệnh Telegram đã parse; đăng tin xác nhận lên mailbox (sender
 // martin, source telegram) để cả 3 Muse đều thấy, rồi trả text để gửi
-// lại Telegram. Trả null khi lệnh không phải của bridge.
+// lại Telegram. Trả null khi lệnh không phải của bridge. /start (v1.13.0)
+// trả {text, replyMarkup} để gửi kèm bàn phím menu thay vì text thuần.
 async function handleTelegramCommand(parsed) {
   if (!parsed) return null;
+  if (parsed.cmd === 'start') return { text: MENU_TEXT, replyMarkup: menuKeyboard() };
   if (parsed.cmd === 'help') return TASK_COMMANDS_HELP;
   if (parsed.cmd === 'tasks') return listOpenTasksText();
   if (parsed.cmd === 'bad') return parsed.error;
@@ -1354,8 +1474,16 @@ async function forwardToTelegram(msg) {
   const taskSuffix = msg.task
     ? ` [${msg.task.status || 'todo'}${msg.task.assignee ? ' · ' + msg.task.assignee : ''}${msg.task.deadline ? ' · hạn ' + msg.task.deadline : ''}]` : '';
   const text = `${mentionPrefix}[${msg.sender}]${taskSuffix} ${msg.text}`;
-  const ok = await sendToTelegram(text, mergeKeyboards(taskKeyboard(msg), prKeyboard(msg)));
+  const r = await sendTelegramMessage(text, mergeKeyboards(taskKeyboard(msg), prKeyboard(msg)));
+  const ok = r.ok;
   if (ok) {
+    // Lưu id tin Telegram để tra ngược khi Martin bấm reaction ✅ (v1.13.0).
+    // Chỉ persist khi id mới xuất hiện (1 lần / tin) để không ghi lại file
+    // mỗi lần forward.
+    if (r.messageId !== null && r.messageId !== undefined && msg.telegramMessageId !== r.messageId) {
+      msg.telegramMessageId = r.messageId;
+      persistMessages();
+    }
     markDelivered(msg, true);
   } else {
     markDelivered(msg, false, lastTelegramError || 'send failed');
@@ -2127,6 +2255,51 @@ function sweepTaskReminders() {
 // off 5s after a 409 so Telegram's lock can clear.
 let tgOffset = 0;
 let tgSeen = new Set();
+// ---------- Xác nhận bằng reaction ✅ (v1.13.0, ý 3 của Muse A ở #282) ----------
+// Martin bấm ✅ vào tin gốc trên Telegram → bridge ghi 'martin' vào
+// read_by VÀ confirmed_by của tin board tương ứng (tra qua
+// telegramMessageId đã lưu lúc forwardToTelegram). Reaction khác ✅
+// chỉ ghi đã đọc. Gỡ ✅ thì gỡ xác nhận (vẫn giữ đã đọc). Không gửi
+// thêm tin Telegram nào, không đăng gì lên thread — chỉ ghi audit để
+// Martin kiểm tra lại được. Tin không phải do bridge forward (không
+// có telegramMessageId) thì bỏ qua.
+async function handleTelegramReaction(reaction) {
+  if (!TELEGRAM_REACTION_CONFIRM_ENABLED) return;
+  if (!reaction || typeof reaction !== 'object') return;
+  if (String(reaction.chat?.id) !== String(TELEGRAM_CHAT_ID)) return;
+  const tgMsgId = reaction.message_id;
+  if (tgMsgId === undefined || tgMsgId === null) return;
+  const msg = messages.find((m) => m.telegramMessageId === tgMsgId);
+  if (!msg) return;
+  const newEmojis = (reaction.new_reaction || [])
+    .map((r) => (r && typeof r === 'object' ? r.emoji : null))
+    .filter(Boolean);
+  const hasCheck = newEmojis.includes('✅');
+  let changed = false;
+  // Reaction nào cũng nghĩa là đã đọc tin đó.
+  if (newEmojis.length > 0) {
+    msg.read_by = msg.read_by || [];
+    if (!msg.read_by.includes('martin')) {
+      msg.read_by.push('martin');
+      changed = true;
+    }
+  }
+  // Chỉ ✅ mới là xác nhận.
+  msg.confirmed_by = msg.confirmed_by || [];
+  if (hasCheck && !msg.confirmed_by.includes('martin')) {
+    msg.confirmed_by.push('martin');
+    changed = true;
+    appendAudit({ action: 'message.reaction-confirm', sender: 'martin', messageId: msg.id, source: 'telegram' });
+    console.log(`[telegram] reaction ✅ #${msg.id} martin đã xác nhận`);
+  } else if (!hasCheck && msg.confirmed_by.includes('martin')) {
+    msg.confirmed_by = msg.confirmed_by.filter((r) => r !== 'martin');
+    changed = true;
+    appendAudit({ action: 'message.reaction-confirm-removed', sender: 'martin', messageId: msg.id, source: 'telegram' });
+    console.log(`[telegram] reaction ✅ gỡ #${msg.id} martin đã gỡ xác nhận`);
+  }
+  if (changed) persistMessages();
+}
+
 let tgPolling = false;
 let tgNextDelayMs = TELEGRAM_POLL_MS;
 function schedulePoll() {
@@ -2139,7 +2312,12 @@ async function pollTelegram() {
   if (tgPolling) return; // never run two getUpdates at once, even if called twice
   tgPolling = true;
   try {
-    const url = tgApi('getUpdates') + `?timeout=0&offset=${tgOffset}`;
+    // allowed_updates (v1.13.0): mặc định Bot API KHÔNG gửi message_reaction
+    // — phải liệt kê rõ thì Martin bấm ✅ mới về tới bridge. Chỉ liệt kê
+    // các loại bridge đang xử lý (message, channel_post, callback_query,
+    // message_reaction); loại không liệt kê sẽ không được gửi nữa.
+    const allowedUpdates = encodeURIComponent(JSON.stringify(['message', 'channel_post', 'callback_query', 'message_reaction']));
+    const url = tgApi('getUpdates') + `?timeout=0&offset=${tgOffset}&allowed_updates=${allowedUpdates}`;
     const res = await fetch(url);
     lastTelegramPollAt = new Date().toISOString();
     if (!res.ok) {
@@ -2156,6 +2334,13 @@ async function pollTelegram() {
     const data = await res.json();
     for (const upd of data.result || []) {
       tgOffset = Math.max(tgOffset, upd.update_id + 1);
+      // Reaction ✅ (v1.13.0, ý 3 của Muse A ở #282): Martin bấm ✅ vào
+      // tin gốc trên Telegram để xác nhận đã đọc — ghi lên tin board,
+      // không gửi thêm tin nào, không đăng gì lên thread.
+      if (upd.message_reaction) {
+        await handleTelegramReaction(upd.message_reaction);
+        continue;
+      }
       // Nút inline (v1.4.0): callback_query từ nút dưới tin task. Chỉ nhận
       // từ chat đã cấu hình; dữ liệu sai thì bỏ qua, không đăng gì.
       if (upd.callback_query) {
@@ -2167,6 +2352,16 @@ async function pollTelegram() {
         const answerCallback = async (text) => {
           try { await fetch(tgApi('answerCallbackQuery'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callback_query_id: cq.id, text: String(text || '').slice(0, 200) }) }); } catch {}
         };
+        // Menu /start (v1.13.0): bấm 1 mục thì sửa ngay tin menu thành
+        // nội dung mục đó, giữ nguyên bàn phím để bấm tiếp; sửa lỗi
+        // (tin đã bị sửa giống hệt / quá cũ) thì gửi tin mới thay thế.
+        if (parsed.kind === 'menu') {
+          const text = parsed.section === 'main' ? MENU_TEXT : await buildMenuSectionText(parsed.section);
+          const edited = await editTelegramMessage(cq.message.chat.id, cq.message.message_id, text, menuKeyboard());
+          if (!edited) await sendToTelegram(text, menuKeyboard());
+          await answerCallback('Đã cập nhật');
+          continue;
+        }
         // Nút PR (v1.9.0): ✅ Duyệt / 🔀 Merge — xem handlePrApproval.
         if (parsed.kind === 'pr') {
           const r = await handlePrApproval({ repo: parsed.repo, number: parsed.number, action: parsed.action, via: 'nút Telegram' });
@@ -2215,11 +2410,15 @@ async function pollTelegram() {
       if (tgSeen.size > 1000) tgSeen = new Set([...tgSeen].slice(-500));
       // Lệnh task (v1.4.0): xử lý, đăng xác nhận lên thread, trả lời lại
       // Telegram — không đưa lệnh vào mailbox như tin chat thường.
+      // /start (v1.13.0) trả {text, replyMarkup} để gửi kèm bàn phím menu.
       if (TELEGRAM_COMMANDS_ENABLED) {
         const parsed = parseTelegramCommand(m.text);
         if (parsed) {
           const reply = await handleTelegramCommand(parsed);
-          if (reply) await sendToTelegram(reply);
+          if (reply) {
+            if (typeof reply === 'object') await sendToTelegram(reply.text, reply.replyMarkup);
+            else await sendToTelegram(reply);
+          }
           continue;
         }
       }
@@ -2377,8 +2576,10 @@ function mentionBadge(m) {
 }
 
 function readBadge(m) {
-  if (!m.read_by || m.read_by.length === 0) return '';
-  return `<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ${m.read_by.map(esc).join(', ')}</div>`;
+  if ((!m.read_by || m.read_by.length === 0) && (!m.confirmed_by || m.confirmed_by.length === 0)) return '';
+  const read = (m.read_by && m.read_by.length) ? `Đã đọc: ${m.read_by.map(esc).join(', ')}` : '';
+  const confirmed = (m.confirmed_by && m.confirmed_by.length) ? ` · ✅ ${m.confirmed_by.map(esc).join(', ')} đã xác nhận` : '';
+  return `<div style="color:#888;font-size:12px;margin-top:4px">${read}${confirmed}</div>`;
 }
 
 // Panel "Có gì mới từ lần trước bạn ghé" (v1.7.0): dùng tóm tắt lăn
@@ -2957,8 +3158,8 @@ ${main}
     }
     var reply = m.reply_to ? '<div style="color:#888;font-size:12px">Trả lời #' + m.reply_to + '</div>' : '';
     var type = m.type ? '<span style="color:#888;font-size:12px">[' + escHtml(m.type) + ']</span> ' : '';
-    var read = (m.read_by && m.read_by.length)
-      ? '<div style="color:#888;font-size:12px;margin-top:4px">Đã đọc: ' + m.read_by.map(escHtml).join(', ') + '</div>' : '';
+    var read = ((m.read_by && m.read_by.length) || (m.confirmed_by && m.confirmed_by.length))
+      ? '<div style="color:#888;font-size:12px;margin-top:4px">' + ((m.read_by && m.read_by.length) ? 'Đã đọc: ' + m.read_by.map(escHtml).join(', ') : '') + ((m.confirmed_by && m.confirmed_by.length) ? ' · ✅ ' + m.confirmed_by.map(escHtml).join(', ') + ' đã xác nhận' : '') + '</div>' : '';
     var pinMark = m.pinned ? ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">📌 đã ghim</span>' : '';
     var pinBtn = '<form method="POST" action="/b/' + TOKEN + '/pin" style="display:inline;margin:0">'
       + '<input type="hidden" name="id" value="' + m.id + '">'
@@ -3325,7 +3526,8 @@ function renderMarkdownExport(list) {
     const task = m.task ? ` [${m.task.status || 'todo'}${m.task.assignee ? ' · ' + m.task.assignee : ''}${m.task.deadline ? ' · hạn ' + m.task.deadline : ''}]` : '';
     const meta = `${m.type ? ` [${m.type}]` : ''}${m.reply_to ? ` (trả lời #${m.reply_to})` : ''}${(m.mentions || []).length ? ` [@${m.mentions.join(' @')}]` : ''}`;
     const read = (m.read_by || []).length ? `\n*Đã đọc: ${m.read_by.join(', ')}*` : '';
-    lines.push(`## #${m.id} ${m.sender}${task}${meta}`, '', `*${m.ts} · ${m.source}*${read}`, '', m.text, '');
+    const confirmed = (m.confirmed_by || []).length ? `\n*✅ ${m.confirmed_by.join(', ')} đã xác nhận*` : '';
+    lines.push(`## #${m.id} ${m.sender}${task}${meta}`, '', `*${m.ts} · ${m.source}*${read}${confirmed}`, '', m.text, '');
   }
   return lines.join('\n');
 }
