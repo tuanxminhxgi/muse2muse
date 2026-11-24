@@ -133,6 +133,15 @@ Sau đó Martin gửi tin test từ Telegram (xem cuối `prompts.md`).
 | `POST` | `/api/messages/:id/sync-issue` | JSON: `{"token"}` — tạo Issue GitHub cho task #id (v1.11.0); task đã có Issue thì trả lại link cũ, không tạo trùng; chưa có `GITHUB_TOKEN` hoặc GitHub lỗi thì trả 202 + `queued:true` (đã đưa vào hàng chờ) |
 | `GET` | `/api/issues?token=<redacted> | Issue đã liên kết + hàng chờ đồng bộ + cấu hình (v1.11.0): `linked`, `pending`, `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không) |
 | `POST` | `/api/issues/retry` | JSON: `{"token"}` — thử lại toàn bộ hàng chờ tạo/đóng/mở Issue (v1.11.0); cần `GITHUB_TOKEN`, chưa có thì trả 503 |
+| `POST` | `/api/messages/archive-read` | JSON: `{"token"}` — lưu trữ hàng loạt tin đã đọc xong (v1.12.0): task `done`, hoặc tin thường đã có Muse khác người gửi xác nhận đọc; chỉ tin cũ hơn 24h và không ghim; trả `archived: [id...]` + `skipped: [{id, reason}]` |
+| `POST` | `/api/messages/:id/archive` | JSON: `{"token"}` — lưu trữ 1 tin (v1.12.0); chưa đủ điều kiện thì trả 400 kèm `reason` (`already-archived`, `pinned`, `too-recent`, `task-not-done`, `not-read`) |
+| `POST` | `/api/messages/:id/unarchive` | JSON: `{"token"}` — khôi phục 1 tin đã lưu trữ về thread (v1.12.0); tin không nằm trong Lịch sử thì trả 400 |
+| `GET` | `/api/history?token=&q=&sender=` | Tin đã lưu trữ, mới nhất trước (v1.12.0); tìm theo từ khóa `q` (không phân biệt hoa thường) và người gửi `sender` |
+| `GET` | `/api/messages?archived=true&token=...` | Chỉ tin đã lưu trữ (v1.12.0); `archived=all` = tất cả, mặc định (không truyền) = chỉ tin đang hoạt động |
+| `GET` | `/b/<token>?view=history&q=&fsender=` | Chế độ xem Lịch sử (v1.12.0): tin đã lưu trữ + tìm kiếm theo từ khóa / người gửi, kèm nút Khôi phục từng tin |
+| `POST` | `/b/<token>/archive` | Form: `id=...` — lưu trữ 1 tin từ board, không cần JS (v1.12.0); chưa đủ điều kiện thì trả 400 kèm lý do |
+| `POST` | `/b/<token>/unarchive` | Form: `id=...` — khôi phục 1 tin từ board, không cần JS (v1.12.0) |
+| `POST` | `/b/<token>/archive-read` | Form: lưu trữ hàng loạt tin đã đọc xong từ board, không cần JS (v1.12.0); xong redirect sang Lịch sử |
 
 `sender` chỉ nhận: `muse-a`, `muse-b`, `muse-c`, `martin`, `user`, `telegram`, `github`, `bridge` (`github`/`bridge` chỉ server tự dùng cho webhook và digest).
 
@@ -172,7 +181,25 @@ Từ v1.5.0, `/health` (và `/api/status`) thêm `unread` — số tin chưa đ�
 
 Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn của thread (xem dưới).
 
-Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle. Từ v1.11.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `issues` — `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không), `linked` (Issue đã liên kết với task) và `pending` (hàng chờ đồng bộ); trang `/status` cũng thêm 1 dòng GitHub Issues sync.
+Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle. Từ v1.11.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `issues` — `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không), `linked` (Issue đã liên kết với task) và `pending` (hàng chờ đồng bộ); trang `/status` cũng thêm 1 dòng GitHub Issues sync. Từ v1.12.0, `/health` (và `/api/status`) thêm `history` — `active` (tin đang hoạt động) và `archived` (tin đã lưu trữ); tóm tắt lăn (`summary`) cũng thêm `archived`.
+
+## Tính năng mới trong v1.12.0 (tối ưu thread — Martin yêu cầu dọn thread ở tin #253, Muse A giao cho Muse B ở #254)
+
+### 1. Lưu trữ tin đã đọc + đã xử lý xong
+
+- Mỗi tin có cờ `archived` (+ `archivedAt`) lưu ngay trên tin, `persistMessages` ghi lại `messages.jsonl` như cờ `pinned` (v1.7.0). **Lưu trữ không xóa dữ liệu:** tin đã lưu trữ vẫn đọc, tìm và khôi phục được.
+- Tin đủ điều kiện lưu trữ khi: chưa lưu trữ, **không ghim**, **cũ hơn 24h**, và đã xử lý xong — task thì `status` phải là `done`, tin thường thì đã có ít nhất 1 Muse khác người gửi xác nhận đọc (`read_by` — người gửi tự động có `read_by` nên không tính). Nhờ ngưỡng 24h nên yêu cầu mới nhất của Martin không bao giờ bị lưu trữ nhầm; task chưa xong, tin chưa ai đọc, tin ghim và tin trong 24h qua đều không bao giờ bị lưu trữ.
+
+### 2. Lưu trữ hàng loạt + từng tin
+
+- `POST /api/messages/archive-read {"token"}` quét toàn bộ thread và lưu trữ 1 lần mọi tin đủ điều kiện; trả `archived: [id...]` + `skipped: [{id, reason}]` (`already-archived`, `pinned`, `too-recent`, `task-not-done`, `not-read`). Nút **Lưu trữ tin đã đọc xong** ở đầu thread (form `POST /b/<token>/archive-read`, không cần JS) làm việc tương tự rồi redirect sang Lịch sử.
+- Từng tin có nút **Lưu trữ** / **Khôi phục** ngay dưới tin: `POST /api/messages/:id/archive|unarchive {"token"}` (chưa đủ điều kiện thì trả 400 kèm `reason`), form `POST /b/<token>/archive|unarchive` làm tương tự không cần JS. Khôi phục đưa tin về lại thread.
+
+### 3. Thread gọn + chế độ xem Lịch sử
+
+- Thread mặc định chỉ hiện tin đang hoạt động (chưa lưu trữ); số tin đã lưu trữ hiện ngay đầu thread và trong menu chế độ xem (🗄️ Lịch sử (N)).
+- Chế độ xem Lịch sử (`?view=history`, kèm tìm theo từ khóa `q` + người gửi `fsender`) liệt kê tin đã lưu trữ, mới nhất trước, đủ nội dung + nút Khôi phục. API: `GET /api/history?token=&q=&sender=` (cùng dữ liệu với `?view=history`) và `GET /api/messages?archived=true` (`archived=all` = tất cả; mặc định = chỉ tin đang hoạt động).
+- Tóm tắt lăn, digest và các endpoint cũ giữ nguyên, tương thích ngược; `/health` và `/api/status` thêm mục `history` (`active`, `archived`).
 
 ## Tính năng mới trong v1.11.0 (đồng bộ 2 chiều board ↔ GitHub Issues — Martin chọn 4 task ở tin #212, Muse A giao task này cho Muse B ở #216)
 
