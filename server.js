@@ -186,6 +186,27 @@
 //      Không thêm field hay file mới ngoài voted_by / priority trên tin.
 //
 // Ghi chú: lúc làm v1.9.0, nội dung repo lại bị gắn cờ execution-risk
+// v1.11.0 (Muse B: đồng bộ 2 chiều board ↔ GitHub Issues, tin #212/#216 —
+// Martin chọn 4 task ở #212, Muse A giao task này cho Muse B ở #216;
+// Martin xác nhận ở #111. PR trước (#14) đã lấy v1.9.0):
+//   1) Board → GitHub: nút "Tạo Issue" trên mỗi task (hoặc POST
+//      /api/messages/:id/sync-issue) tạo 1 Issue trên GitHub từ task
+//      (tiêu đề = dòng đầu của task, kèm link về tin gốc, label
+//      GITHUB_ISSUES_LABEL), lưu link vào task.issue {repo, number,
+//      url, state, syncedAt}. Task đổi sang done thì Issue tự đóng,
+//      mở lại task thì Issue tự mở lại (gọi GitHub API).
+//   2) GitHub → board: webhook issues/issue_comment (đã có sẵn event
+//      issues từ v1.3.0, nay thêm issue_comment + state/labels vào meta)
+//      phản chiếu lên thread; Issue đóng/mở lại trên GitHub thì task
+//      liên kết đổi trạng thái theo (done/todo).
+//   3) Chưa có GITHUB_TOKEN thì tính năng tự hạ cấp: yêu cầu tạo/đóng/
+//      mở Issue được đưa vào hàng chờ (issue-sync.json) và hiện cờ
+//      "chờ đồng bộ" trên task; POST /api/issues/retry thử lại khi đã
+//      có token. GET /api/issues liệt kê Issue đã liên kết + hàng chờ;
+//      /health, /api/status và panel board thêm mục issues (chỉ báo có
+//      token hay không, không bao giờ lộ token).
+//
+// Ghi chú: lúc làm v1.11.0, nội dung repo lại bị gắn cờ execution-risk
 // (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
 // board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
 //
@@ -202,7 +223,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.10.0';
+const VERSION = '1.11.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -275,6 +296,16 @@ const REVIEW_LARGE_LINES = 800;
 // (đặt tay khi gặp): implement-group3 và implement-idea4-saved đều là
 // nhánh của Muse C.
 const KNOWN_BRANCH_AUTHORS = { 'implement-group3': 'muse-c', 'implement-idea4-saved': 'muse-c' };
+// Đồng bộ 2 chiều board ↔ GitHub Issues (v1.11.0): GITHUB_TOKEN dùng
+// chung cho cả tạo/đóng/mở Issue (xem githubApi). GITHUB_ISSUES_REPO là
+// repo nhận Issue (mặc định muse2muse); GITHUB_ISSUES_LABEL là label
+// gắn lên Issue tạo từ board. GITHUB_ISSUES_SYNC_ENABLED=0 tắt hẳn
+// tính năng (webhook issues vẫn đăng tin như cũ, chỉ không liên kết
+// task ↔ Issue nữa).
+const GITHUB_ISSUES_SYNC_ENABLED = (process.env.GITHUB_ISSUES_SYNC_ENABLED || 'true').toLowerCase() !== 'false';
+const GITHUB_ISSUES_REPO = (process.env.GITHUB_ISSUES_REPO || 'tuanxminhxgi/muse2muse').trim();
+const GITHUB_ISSUES_LABEL = (process.env.GITHUB_ISSUES_LABEL || 'board-task').trim();
+const ISSUE_SYNC_FILE = path.join(__dirname, 'issue-sync.json');
 const MUSES = ['muse-a', 'muse-b', 'muse-c'];
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -903,6 +934,7 @@ function applyTaskUpdate({ id, status, assignee }, opts = {}) {
     const t = checkTransition(msg.task, status);
     if (!t.ok) return { ok: false, error: t.error };
   }
+  const prevStatus = msg.task.status;
   const next = { ...msg.task };
   if (status !== undefined) next.status = status;
   if (assignee !== undefined) next.assignee = assignee;
@@ -913,6 +945,11 @@ function applyTaskUpdate({ id, status, assignee }, opts = {}) {
   msg.task = next;
   persistMessages();
   appendAudit({ action: 'task.update', sender: 'martin', messageId: msg.id, source: 'telegram' });
+  // Đồng bộ 2 chiều (v1.11.0): task sang done thì Issue liên kết tự
+  // đóng, task từ done mở lại thì Issue tự mở lại (fire-and-forget).
+  if (status !== undefined && prevStatus !== next.status) {
+    syncIssueState(msg, prevStatus, next.status).catch((e) => console.error('[issues] sync error:', e.message));
+  }
   return { ok: true, message: msg };
 }
 
@@ -975,21 +1012,27 @@ async function handleTelegramCommand(parsed) {
 // chưa đặt token thì ghi quyết định "Martin yêu cầu merge" + trả link để
 // Martin merge tay trên GitHub. Cờ kiểm tra rủi ro phía Muse thì nút
 // không bấm hộ được — vẫn cần lời xác nhận trực tiếp của Martin.
-async function mergePullRequest(repo, number) {
+async function githubApi(path, method, body) {
   if (!GITHUB_TOKEN) return { ok: false, error: 'chưa đặt GITHUB_TOKEN trong .env' };
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${number}/merge`, {
-      method: 'PUT',
+    const res = await fetch(`https://api.github.com${path}`, {
+      method: method || 'GET',
       headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${GITHUB_TOKEN}`, 'user-agent': 'muse-bridge' },
-      body: JSON.stringify({}),
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
     });
     const data = await res.json().catch(() => ({}));
-    if (res.ok) return { ok: true, sha: data.sha || null, message: data.message || 'Merged' };
-    return { ok: false, error: data.message || `GitHub trả ${res.status}` };
+    if (res.ok) return { ok: true, status: res.status, data };
+    return { ok: false, status: res.status, error: data.message || `GitHub trả ${res.status}` };
   } catch (e) {
     return { ok: false, error: e.message };
   }
+}
+
+async function mergePullRequest(repo, number) {
+  const r = await githubApi(`/repos/${repo}/pulls/${number}/merge`, 'PUT', {});
+  if (r.ok) return { ok: true, sha: r.data.sha || null, message: r.data.message || 'Merged' };
+  return { ok: false, error: r.error };
 }
 
 async function handlePrApproval({ repo, number, action, via }) {
@@ -1022,6 +1065,221 @@ async function handlePrApproval({ repo, number, action, via }) {
   appendAudit({ action: 'pr.merge.failed', sender: 'martin', messageId: msg.id, source: 'telegram' });
   console.log(`[telegram] merge failed #${msg.id} PR ${repo}#${number}: ${r.error}`);
   return { ok: false, reply: `Merge PR #${number} thất bại: ${r.error}. Merge tay tại: ${url}`, boardMessage: msg };
+}
+
+// ---------- Đồng bộ 2 chiều board ↔ GitHub Issues (v1.11.0) ----------
+// task.issue (lưu ngay trên task trong messages.jsonl):
+//   { repo, number, url, state: 'open'|'closed', syncedAt }
+// Hàng chờ (issue-sync.json): yêu cầu tạo/đóng/mở Issue chưa làm được
+// vì chưa có GITHUB_TOKEN hoặc GitHub API lỗi — thử lại bằng
+// POST /api/issues/retry khi đã có token. Mỗi messageId chỉ giữ 1
+// mục chờ / loại hành động (mục mới ghi đè mục cũ cùng loại).
+let issueSyncQueue = [];
+try {
+  const raw = JSON.parse(fs.readFileSync(ISSUE_SYNC_FILE, 'utf8'));
+  if (Array.isArray(raw.pending)) issueSyncQueue = raw.pending;
+} catch { /* first run: no file yet */ }
+
+function persistIssueSyncQueue() {
+  fs.writeFileSync(ISSUE_SYNC_FILE, JSON.stringify({ pending: issueSyncQueue }, null, 2) + '\n');
+}
+function queueIssueSync(item) {
+  const queuedAt = new Date().toISOString();
+  const idx = issueSyncQueue.findIndex((q) => q.messageId === item.messageId && q.action === item.action);
+  const entry = { ...item, queuedAt, lastError: item.lastError || null };
+  if (idx >= 0) issueSyncQueue[idx] = entry; else issueSyncQueue.push(entry);
+  persistIssueSyncQueue();
+  return entry;
+}
+function issueSyncStatus() {
+  const linked = messages.filter((m) => m.task?.issue).map((m) => ({
+    messageId: m.id, repo: m.task.issue.repo, number: m.task.issue.number,
+    url: m.task.issue.url, state: m.task.issue.state || 'open',
+    taskStatus: m.task.status, assignee: m.task.assignee || null,
+  }));
+  return {
+    enabled: GITHUB_ISSUES_SYNC_ENABLED,
+    repo: GITHUB_ISSUES_REPO,
+    label: GITHUB_ISSUES_LABEL,
+    tokenConfigured: Boolean(GITHUB_TOKEN),
+    linked,
+    pending: issueSyncQueue,
+  };
+}
+function findLinkedMessage(repo, number) {
+  return messages.find((m) => m.task?.issue
+    && m.task.issue.repo === repo && Number(m.task.issue.number) === Number(number));
+}
+function issueTitleFor(msg) {
+  return String(msg.text || '').split('\n')[0].trim().slice(0, 120) || `Task #${msg.id}`;
+}
+function issueBodyFor(msg) {
+  const t = msg.task || {};
+  return [
+    `Đồng bộ từ board muse2muse — tin #${msg.id} (sender: ${msg.sender}).`,
+    '',
+    String(msg.text || ''),
+    '',
+    `Trạng thái: ${t.status || 'todo'}${t.assignee ? ` · Giao cho: ${t.assignee}` : ''}${t.deadline ? ` · Hạn: ${t.deadline}` : ''}`,
+    'Mở lại / đóng task trên board thì Issue này tự đóng / mở theo.',
+  ].join('\n');
+}
+// Tạo Issue GitHub cho 1 task (dùng khi bấm "Tạo Issue" hoặc retry hàng
+// chờ). Trả {ok, issue} khi tạo xong; {ok:false, queued:true} khi chưa
+// có token hoặc GitHub lỗi (đã đưa vào hàng chờ).
+async function createIssueForTask(msg) {
+  if (!GITHUB_ISSUES_SYNC_ENABLED) return { ok: false, error: 'đồng bộ Issues đang tắt (GITHUB_ISSUES_SYNC_ENABLED=0)' };
+  if (!msg.task) return { ok: false, error: `tin #${msg.id} không phải task` };
+  if (msg.task.issue) return { ok: true, already: true, issue: msg.task.issue };
+  if (!GITHUB_TOKEN) {
+    msg.task.issuePending = true;
+    persistMessages();
+    queueIssueSync({ messageId: msg.id, action: 'create', repo: GITHUB_ISSUES_REPO });
+    appendAudit({ action: 'issue.sync.queued', sender: 'bridge', messageId: msg.id, source: 'issue-sync' });
+    return { ok: false, queued: true, error: 'chưa đặt GITHUB_TOKEN trong .env — đã đưa vào hàng chờ đồng bộ' };
+  }
+  const title = issueTitleFor(msg);
+  const body = issueBodyFor(msg);
+  let r = await githubApi(`/repos/${GITHUB_ISSUES_REPO}/issues`, 'POST', { title, body, labels: [GITHUB_ISSUES_LABEL] });
+  if (!r.ok && r.status === 422 && /label/i.test(r.error || '')) {
+    // Repo chưa có label board-task: tạo lại không kèm label thay vì lỗi.
+    r = await githubApi(`/repos/${GITHUB_ISSUES_REPO}/issues`, 'POST', { title, body });
+  }
+  if (!r.ok) {
+    msg.task.issuePending = true;
+    persistMessages();
+    queueIssueSync({ messageId: msg.id, action: 'create', repo: GITHUB_ISSUES_REPO, lastError: r.error });
+    appendAudit({ action: 'issue.sync.queued', sender: 'bridge', messageId: msg.id, source: 'issue-sync' });
+    return { ok: false, queued: true, error: `GitHub báo lỗi: ${r.error} — đã đưa vào hàng chờ đồng bộ` };
+  }
+  const issue = r.data || {};
+  msg.task.issue = {
+    repo: GITHUB_ISSUES_REPO, number: issue.number,
+    url: issue.html_url || `https://github.com/${GITHUB_ISSUES_REPO}/issues/${issue.number}`,
+    state: issue.state || 'open', syncedAt: new Date().toISOString(),
+  };
+  delete msg.task.issuePending;
+  persistMessages();
+  appendAudit({ action: 'issue.sync.created', sender: 'bridge', messageId: msg.id, source: 'issue-sync' });
+  console.log(`[issues] created ${GITHUB_ISSUES_REPO}#${issue.number} for message #${msg.id}`);
+  return { ok: true, issue: msg.task.issue };
+}
+// Đồng bộ trạng thái Issue theo task: task sang done → đóng Issue;
+// task từ done mở lại (todo/doing/review/blocked) → mở lại Issue.
+// Chạy fire-and-forget sau khi task đã đổi trạng thái (không chặn API
+// trả về); lỗi / chưa có token thì đưa vào hàng chờ để retry sau.
+async function syncIssueState(msg, prevStatus, nextStatus) {
+  if (!GITHUB_ISSUES_SYNC_ENABLED) return;
+  const link = msg.task?.issue;
+  if (!link) return;
+  const wantClosed = nextStatus === 'done' && prevStatus !== 'done';
+  const wantReopen = prevStatus === 'done' && nextStatus !== 'done';
+  if (!wantClosed && !wantReopen) return;
+  const action = wantClosed ? 'close' : 'reopen';
+  if (!GITHUB_TOKEN) {
+    queueIssueSync({ messageId: msg.id, action, repo: link.repo, number: link.number });
+    console.log(`[issues] no token — queued ${action} for ${link.repo}#${link.number} (msg #${msg.id})`);
+    return;
+  }
+  const r = await githubApi(`/repos/${link.repo}/issues/${link.number}`, 'PATCH', { state: wantClosed ? 'closed' : 'open' });
+  if (!r.ok) {
+    queueIssueSync({ messageId: msg.id, action, repo: link.repo, number: link.number, lastError: r.error });
+    console.log(`[issues] ${action} failed for ${link.repo}#${link.number}: ${r.error} — queued`);
+    return;
+  }
+  link.state = wantClosed ? 'closed' : 'open';
+  link.syncedAt = new Date().toISOString();
+  persistMessages();
+  appendAudit({ action: `issue.sync.${action}`, sender: 'bridge', messageId: msg.id, source: 'issue-sync' });
+  console.log(`[issues] ${action} ${link.repo}#${link.number} (msg #${msg.id})`);
+}
+// Thử lại toàn bộ hàng chờ (tạo/đóng/mở Issue). Mục nào xong thì xóa
+// khỏi hàng chờ, mục nào vẫn lỗi thì giữ lại kèm lastError.
+async function retryIssueSync() {
+  if (!GITHUB_TOKEN) return { ok: false, error: 'chưa đặt GITHUB_TOKEN trong .env' };
+  const results = [];
+  for (const item of [...issueSyncQueue]) {
+    const msg = messages.find((m) => m.id === item.messageId);
+    if (!msg || !msg.task) {
+      issueSyncQueue = issueSyncQueue.filter((q) => q !== item);
+      results.push({ ...item, ok: false, error: 'không còn tin/task đó trên board — đã bỏ khỏi hàng chờ' });
+      continue;
+    }
+    if (item.action === 'create') {
+      const r = await createIssueForTask(msg);
+      // createIssueForTask tự đưa lại vào hàng chờ khi lỗi — tránh trùng.
+      if (r.ok) {
+        issueSyncQueue = issueSyncQueue.filter((q) => q !== item);
+        results.push({ ...item, ok: true });
+      } else {
+        results.push({ ...item, ok: false, error: r.error });
+      }
+      continue;
+    }
+    const link = msg.task.issue;
+    if (!link) {
+      issueSyncQueue = issueSyncQueue.filter((q) => q !== item);
+      results.push({ ...item, ok: false, error: 'task chưa liên kết Issue — đã bỏ khỏi hàng chờ' });
+      continue;
+    }
+    const wantClosed = item.action === 'close';
+    const api = await githubApi(`/repos/${link.repo}/issues/${link.number}`, 'PATCH', { state: wantClosed ? 'closed' : 'open' });
+    if (api.ok) {
+      link.state = wantClosed ? 'closed' : 'open';
+      link.syncedAt = new Date().toISOString();
+      persistMessages();
+      appendAudit({ action: `issue.sync.${item.action}`, sender: 'bridge', messageId: msg.id, source: 'issue-sync' });
+      issueSyncQueue = issueSyncQueue.filter((q) => q !== item);
+      results.push({ ...item, ok: true });
+    } else {
+      item.lastError = api.error;
+      results.push({ ...item, ok: false, error: api.error });
+    }
+  }
+  persistIssueSyncQueue();
+  return { ok: true, results, pending: issueSyncQueue.length };
+}
+// Webhook issues: Issue đóng/mở lại trên GitHub thì task liên kết đổi
+// trạng thái theo (closed → done, reopened → todo). Đồng bộ thắng quy
+// tắc chuyển trạng thái của lifecycle (người đóng Issue trên GitHub đã
+// quyết xong việc); done thì nhả khóa như mọi lần task xong.
+function applyIssueEventToTask(event, payload) {
+  if (!GITHUB_ISSUES_SYNC_ENABLED) return null;
+  if (event !== 'issues') return null;
+  const issue = payload.issue || {};
+  const repo = payload.repository?.full_name || '';
+  const msg = findLinkedMessage(repo, issue.number);
+  if (!msg || !msg.task) return null;
+  const action = payload.action || '';
+  if (action === 'closed' && msg.task.status !== 'done') {
+    const prev = msg.task.status;
+    msg.task.status = 'done';
+    delete msg.task.lockedBy;
+    delete msg.task.lockedAt;
+    msg.task.issue.state = issue.state || 'closed';
+    msg.task.issue.syncedAt = new Date().toISOString();
+    persistMessages();
+    appendAudit({ action: 'issue.sync.inbound', sender: 'github', messageId: msg.id, source: 'issue-sync' });
+    console.log(`[issues] inbound closed ${repo}#${issue.number} → task #${msg.id} ${prev} → done`);
+    return { message: msg, from: prev, to: 'done' };
+  }
+  if (action === 'reopened' && msg.task.status === 'done') {
+    msg.task.status = 'todo';
+    delete msg.task.lockedBy;
+    delete msg.task.lockedAt;
+    msg.task.issue.state = issue.state || 'open';
+    msg.task.issue.syncedAt = new Date().toISOString();
+    persistMessages();
+    appendAudit({ action: 'issue.sync.inbound', sender: 'github', messageId: msg.id, source: 'issue-sync' });
+    console.log(`[issues] inbound reopened ${repo}#${issue.number} → task #${msg.id} done → todo`);
+    return { message: msg, from: 'done', to: 'todo' };
+  }
+  if (msg.task.issue) {
+    // Event khác (edited/labeled/...) chỉ cập nhật state hiển thị.
+    msg.task.issue.state = issue.state || msg.task.issue.state;
+    persistMessages();
+  }
+  return null;
 }
 
 // ---------- Offline outbox (v1.1.0) ----------
@@ -1191,6 +1449,7 @@ async function getBoardStatus() {
     })(),
     autoReview: { enabled: AUTO_REVIEW_ENABLED },
     presence: presenceStatus(),
+    issues: issueSyncStatus(),
   };
 }
 
@@ -1230,6 +1489,12 @@ function formatGitHubEvent(event, payload) {
   if (event === 'issues') {
     const issue = payload.issue || {};
     return `[github] Issue #${issue.number} ${repo} — ${payload.action}: "${issue.title}" bởi ${sender}\n${issue.html_url || ''}`;
+  }
+  if (event === 'issue_comment') {
+    const issue = payload.issue || {};
+    const comment = payload.comment || {};
+    const body = String(comment.body || '').split('\n')[0].slice(0, 200);
+    return `[github] Bình luận trên Issue #${issue.number} ${repo} — "${issue.title}" bởi ${sender}: "${body}"\n${comment.html_url || issue.html_url || ''}`;
   }
   if (event === 'release') {
     const rel = payload.release || {};
@@ -1276,6 +1541,22 @@ function buildGitHubMeta(event, payload) {
       event, repo, number: issue.number, title: issue.title || '',
       action: payload.action || '', url: issue.html_url || null,
       author: payload.sender?.login || '',
+      state: issue.state || null,
+      labels: (issue.labels || []).map((l) => l.name || l).filter(Boolean),
+    };
+  }
+  if (event === 'issue_comment') {
+    const issue = payload.issue || {};
+    const comment = payload.comment || {};
+    return {
+      event, repo, number: issue.number, title: issue.title || '',
+      action: payload.action || '', url: issue.html_url || null,
+      author: payload.sender?.login || '',
+      state: issue.state || null,
+      labels: (issue.labels || []).map((l) => l.name || l).filter(Boolean),
+      commentBy: comment.user?.login || payload.sender?.login || '',
+      commentUrl: comment.html_url || null,
+      commentBody: String(comment.body || '').slice(0, 500),
     };
   }
   if (event === 'release') {
@@ -1443,7 +1724,23 @@ async function handleGitHubWebhook(req, res) {
   }
   const text = formatGitHubEvent(event, payload);
   if (!text) return json(res, 200, { ok: true, ignored: `unsupported event: ${event}` });
-  const msg = addMessage({ sender: 'github', text, source: 'github-webhook', github: buildGitHubMeta(event, payload) });
+  const meta = buildGitHubMeta(event, payload);
+  // Đồng bộ 2 chiều (v1.11.0): Issue đóng/mở lại trên GitHub thì task
+  // liên kết đổi trạng thái theo; gắn id tin liên kết vào meta để board
+  // hiện rõ (chỉ khi tìm thấy task liên kết).
+  let linkedMessageId = null;
+  if (event === 'issues' || event === 'issue_comment') {
+    const linked = findLinkedMessage(repo, payload.issue?.number);
+    if (linked) {
+      linkedMessageId = linked.id;
+      if (event === 'issues') {
+        const synced = applyIssueEventToTask(event, payload);
+        if (synced) meta.taskSynced = { messageId: synced.message.id, from: synced.from, to: synced.to };
+      }
+    }
+  }
+  if (linkedMessageId !== null && meta) meta.linkedMessageId = linkedMessageId;
+  const msg = addMessage({ sender: 'github', text, source: 'github-webhook', github: meta });
   console.log(`[github] #${msg.id} ${event} ${repo}`);
   forwardToTelegram(msg);
   // Review chéo PR tự động (v1.10.0): PR mở/cập nhật thì Muse khác tác
@@ -1935,7 +2232,11 @@ function taskBadge(m) {
   // Ưu tiên (v1.10.0): chỉ hiện khi high/low — medium là mặc định, không
   // cần chiếm chỗ trên badge.
   const priority = taskPriority(m.task) !== 'medium' ? ` · ưu tiên ${esc(taskPriority(m.task))}` : '';
-  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}${lock}${priority}]</span>`;
+  // Liên kết Issue (v1.11.0): chip link tới Issue + cờ chờ đồng bộ.
+  const issue = m.task.issue
+    ? ` <span style="background:#e6f4ea;border:1px solid #a7d7b5;border-radius:4px;padding:1px 6px;font-size:12px"><a href="${esc(m.task.issue.url)}">Issue #${esc(m.task.issue.number)} (${esc(m.task.issue.state || 'open')})</a></span>`
+    : (m.task.issuePending ? ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">⏳ chờ đồng bộ Issue</span>' : '');
+  return ` <span style="background:#eef;border:1px solid #ccd;border-radius:4px;padding:1px 6px;font-size:12px">[${esc(m.task.status || 'todo')}${assignee}${deadline}${lock}${priority}]</span>${issue}`;
 }
 
 // Số vote (v1.10.0): chỉ hiện khi có ít nhất 1 vote.
@@ -2018,11 +2319,17 @@ function renderActions(m) {
     ? ` <button type="button" data-action="claim" data-id="${m.id}" title="Nhận việc #${m.id} (khóa task cho bạn, todo → doing)">Nhận việc</button>`
       + ` <button type="button" data-action="release" data-id="${m.id}" title="Nhả khóa task #${m.id}">Nhả việc</button>`
     : '';
+  // Tạo Issue (v1.11.0): chỉ hiện khi task chưa liên kết Issue; bấm
+  // thì JS gọi POST /api/messages/:id/sync-issue (chưa có token thì
+  // đưa vào hàng chờ, không tạo trùng khi bấm lại).
+  const issueBtn = (m.task && !m.task.issue)
+    ? ` <button type="button" data-action="sync-issue" data-id="${m.id}" title="Tạo Issue trên GitHub cho task #${m.id} (chưa có GITHUB_TOKEN thì đưa vào hàng chờ)">Tạo Issue</button>`
+    : '';
   return `<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">`
     + `<button type="button" data-action="reply" data-id="${m.id}" title="Trả lời tin #${m.id} (điền vào form bên dưới)">Trả lời</button>`
     + ` <button type="button" data-action="read" data-id="${m.id}" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>`
     + ` <button type="button" data-action="vote" data-id="${m.id}" title="Bình chọn / rút vote cho tin #${m.id} (theo sender đang chọn trong form)">👍 Bình chọn${voteCount(m) ? ` (${voteCount(m)})` : ''}</button>`
-    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect + claimBtns
+    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect + claimBtns + issueBtn
     + ` <button type="button" data-action="copy" data-id="${m.id}" title="Copy link tới tin #${m.id}">Copy link</button>`
     + `</div>`;
 }
@@ -2076,9 +2383,16 @@ function githubDetails(m) {
     }).join('');
     return `<details style="margin-top:6px"><summary style="cursor:pointer">Chi tiết push — ${g.commits?.length || 0} commit${g.branch ? ` @ ${esc(g.branch)}` : ''}${g.compare ? ` · <a href="${esc(g.compare)}">compare</a>` : ''}</summary><ul>${commits || '<li><i>Không có commit nào trong payload.</i></li>'}</ul></details>`;
   }
-  if (g.event === 'pull_request' || g.event === 'issues') {
+  if (g.event === 'pull_request' || g.event === 'issues' || g.event === 'issue_comment') {
     const kind = g.event === 'pull_request' ? 'PR' : 'Issue';
-    return `<details style="margin-top:6px"><summary style="cursor:pointer">${kind} #${esc(g.number ?? '')} — ${esc(g.title || '')}</summary><div>Trạng thái: ${esc(g.action || '')}${g.merged ? ' (đã merge)' : ''}${g.head && g.base ? ` · ${esc(g.head)} → ${esc(g.base)}` : ''}${g.author ? ` · bởi ${esc(g.author)}` : ''}${g.url ? ` · <a href="${esc(g.url)}">${esc(g.url)}</a>` : ''}</div></details>`;
+    const extra = (g.event === 'issue_comment'
+      ? `${g.commentBy ? ` · bình luận bởi ${esc(g.commentBy)}` : ''}${g.commentBody ? `<div style="margin-top:4px;white-space:pre-wrap">“${esc(String(g.commentBody).split('\n')[0].slice(0, 200))}”</div>` : ''}`
+      : '')
+      + (g.state ? ` · Issue đang ${esc(g.state)}` : '')
+      + (g.labels?.length ? ` · nhãn: ${g.labels.map(esc).join(', ')}` : '')
+      + (g.linkedMessageId ? ` · liên kết task #${esc(g.linkedMessageId)}` : '')
+      + (g.taskSynced ? ` · task #${esc(g.taskSynced.messageId)} đã đổi ${esc(g.taskSynced.from)} → ${esc(g.taskSynced.to)}` : '');
+    return `<details style="margin-top:6px"><summary style="cursor:pointer">${kind} #${esc(g.number ?? '')} — ${esc(g.title || '')}</summary><div>Trạng thái: ${esc(g.action || '')}${g.merged ? ' (đã merge)' : ''}${g.head && g.base ? ` · ${esc(g.head)} → ${esc(g.base)}` : ''}${g.author ? ` · bởi ${esc(g.author)}` : ''}${g.url ? ` · <a href="${esc(g.url)}">${esc(g.url)}</a>` : ''}${extra}</div></details>`;
   }
   if (g.event === 'release') {
     return `<details style="margin-top:6px"><summary style="cursor:pointer">Release ${esc(g.tag || '')} — ${esc(g.title || '')}</summary><div>Trạng thái: ${esc(g.action || '')}${g.author ? ` · bởi ${esc(g.author)}` : ''}${g.url ? ` · <a href="${esc(g.url)}">${esc(g.url)}</a>` : ''}</div></details>`;
@@ -2160,9 +2474,12 @@ function renderKanban(filters) {
       const lockLine = m.task.lockedBy
         ? `<div style="color:#888;font-size:12px;margin-top:4px">🔒 ${esc(m.task.lockedBy)}${lockStale(m.task) ? ' (khóa hết hạn)' : ''}</div>`
         : '';
+      const issueLine = m.task.issue
+        ? `<div style="font-size:12px;margin-top:4px"><a href="${esc(m.task.issue.url)}">Issue #${esc(m.task.issue.number)} (${esc(m.task.issue.state || 'open')})</a></div>`
+        : (m.task.issuePending ? '<div style="font-size:12px;margin-top:4px">⏳ chờ đồng bộ Issue</div>' : '');
       return `<div style="border:1px solid #ddd;border-radius:8px;padding:8px;margin:0 0 8px;background:#fff">
         <b><a href="/b/${esc(BRIDGE_TOKEN)}#msg-${m.id}">#${m.id}</a></b> ${esc(m.sender)}
-        <div style="margin-top:4px">${first}</div>${lockLine}
+        <div style="margin-top:4px">${first}</div>${lockLine}${issueLine}
         <div style="color:#888;font-size:12px;margin-top:4px">${m.task.assignee ? `Giao: ${esc(m.task.assignee)} · ` : ''}${m.task.deadline ? `<span${overdue ? ' style="color:#c00;font-weight:bold"' : ''}>Hạn: ${esc(m.task.deadline)}${overdue ? ' (quá hạn)' : ''}</span>` : 'Chưa có hạn'}</div>
       </div>`;
     }).join('') || '<p style="color:#888;font-size:12px"><i>Không có task nào.</i></p>';
@@ -2370,7 +2687,7 @@ ${main}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -2420,6 +2737,9 @@ ${main}
           }).join('') + '</select>';
       h += ' <button type="button" data-action="claim" data-id="' + m.id + '" title="Nhận việc #' + m.id + ' (khóa task cho bạn, todo → doing)">Nhận việc</button>'
         + ' <button type="button" data-action="release" data-id="' + m.id + '" title="Nhả khóa task #' + m.id + '">Nhả việc</button>';
+      if (!m.task.issue) {
+        h += ' <button type="button" data-action="sync-issue" data-id="' + m.id + '" title="Tạo Issue trên GitHub cho task #' + m.id + ' (chưa có GITHUB_TOKEN thì đưa vào hàng chờ)">Tạo Issue</button>';
+      }
     }
     h += ' <button type="button" data-action="copy" data-id="' + m.id + '" title="Copy link tới tin #' + m.id + '">Copy link</button></div>';
     return h;
@@ -2432,6 +2752,11 @@ ${main}
         escHtml(m.task.status || 'todo') + (m.task.assignee ? ' · ' + escHtml(m.task.assignee) : '') +
         (m.task.deadline ? ' · hạn ' + escHtml(m.task.deadline) : '') +
         (m.task.lockedBy ? ' · 🔒 ' + escHtml(m.task.lockedBy) : '') + pr + ']</span>';
+      if (m.task.issue) {
+        badge += ' <span style="background:#e6f4ea;border:1px solid #a7d7b5;border-radius:4px;padding:1px 6px;font-size:12px"><a href="' + escHtml(m.task.issue.url) + '">Issue #' + escHtml(m.task.issue.number) + ' (' + escHtml(m.task.issue.state || 'open') + ')</a></span>';
+      } else if (m.task.issuePending) {
+        badge += ' <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">⏳ chờ đồng bộ Issue</span>';
+      }
     }
     if (m.voted_by && m.voted_by.length) {
       badge += ' <span style="background:#dcfce7;border:1px solid #86efac;border-radius:4px;padding:1px 6px;font-size:12px">👍 ' + m.voted_by.length + '</span>';
@@ -2457,9 +2782,17 @@ ${main}
           return '<li><code>' + escHtml(c.sha || '') + '</code> ' + escHtml(c.message || '') + (c.author ? ' — ' + escHtml(c.author) : '') + (files ? ' (' + files + ')' : '') + '</li>';
         }).join('');
         gh = '<details style="margin-top:6px"><summary style="cursor:pointer">Chi tiết push — ' + (m.github.commits || []).length + ' commit' + (m.github.branch ? ' @ ' + escHtml(m.github.branch) : '') + '</summary><ul>' + (items || '<li><i>Không có commit nào trong payload.</i></li>') + '</ul></details>';
-      } else if (m.github.event === 'pull_request' || m.github.event === 'issues') {
+      } else if (m.github.event === 'pull_request' || m.github.event === 'issues' || m.github.event === 'issue_comment') {
         var kind = m.github.event === 'pull_request' ? 'PR' : 'Issue';
-        gh = '<details style="margin-top:6px"><summary style="cursor:pointer">' + kind + ' #' + escHtml(m.github.number == null ? '' : m.github.number) + ' — ' + escHtml(m.github.title || '') + '</summary><div>Trạng thái: ' + escHtml(m.github.action || '') + (m.github.merged ? ' (đã merge)' : '') + (m.github.url ? ' · <a href="' + escHtml(m.github.url) + '">' + escHtml(m.github.url) + '</a>' : '') + '</div></details>';
+        var extra = '';
+        if (m.github.event === 'issue_comment') {
+          extra = (m.github.commentBy ? ' · bình luận bởi ' + escHtml(m.github.commentBy) : '') + (m.github.commentBody ? '<div style="margin-top:4px;white-space:pre-wrap">“' + escHtml(String(m.github.commentBody).split('\n')[0].slice(0, 200)) + '”</div>' : '');
+        }
+        if (m.github.state) extra += ' · Issue đang ' + escHtml(m.github.state);
+        if (m.github.labels && m.github.labels.length) extra += ' · nhãn: ' + m.github.labels.map(escHtml).join(', ');
+        if (m.github.linkedMessageId) extra += ' · liên kết task #' + escHtml(m.github.linkedMessageId);
+        if (m.github.taskSynced) extra += ' · task #' + escHtml(m.github.taskSynced.messageId) + ' đã đổi ' + escHtml(m.github.taskSynced.from) + ' → ' + escHtml(m.github.taskSynced.to);
+        gh = '<details style="margin-top:6px"><summary style="cursor:pointer">' + kind + ' #' + escHtml(m.github.number == null ? '' : m.github.number) + ' — ' + escHtml(m.github.title || '') + '</summary><div>Trạng thái: ' + escHtml(m.github.action || '') + (m.github.merged ? ' (đã merge)' : '') + (m.github.url ? ' · <a href="' + escHtml(m.github.url) + '">' + escHtml(m.github.url) + '</a>' : '') + extra + '</div></details>';
       } else if (m.github.event === 'release') {
         gh = '<details style="margin-top:6px"><summary style="cursor:pointer">Release ' + escHtml(m.github.tag || '') + ' — ' + escHtml(m.github.title || '') + '</summary><div>Trạng thái: ' + escHtml(m.github.action || '') + (m.github.url ? ' · <a href="' + escHtml(m.github.url) + '">' + escHtml(m.github.url) + '</a>' : '') + '</div></details>';
       }
@@ -2577,6 +2910,12 @@ ${main}
         api('/api/messages/' + id + '/vote', 'POST', { voter: voter }).then(function (r) {
           if (!r.ok) { alert('Không bình chọn được: ' + (r.json.error || r.status)); return; }
           refreshRow(id);
+        });
+      } else if (action === 'sync-issue') {
+        api('/api/messages/' + id + '/sync-issue', 'POST', { sender: currentSender() }).then(function (r) {
+          if (!r.ok) { alert('Không tạo được Issue: ' + (r.json.error || r.status)); return; }
+          if (r.json.queued) { alert('Chưa có GITHUB_TOKEN — đã đưa task vào hàng chờ đồng bộ, sẽ tạo Issue khi có token (POST /api/issues/retry).'); }
+          refreshRow(id); refreshWhatsNew();
         });
       } else if (action === 'copy') {
         var link = location.origin + location.pathname + '#msg-' + id;
@@ -2806,6 +3145,7 @@ const server = http.createServer(async (req, res) => {
         lockedTasks: messages.filter((m) => m.task?.lockedBy && !lockStale(m.task)).length,
         staleLocks: messages.filter((m) => m.task?.lockedBy && lockStale(m.task)).length,
       },
+      issues: issueSyncStatus(),
     });
   }
 
@@ -2834,6 +3174,7 @@ const server = http.createServer(async (req, res) => {
 <tr><td>Lỗi Telegram cuối</td><td>${esc(lastTelegramError || 'không có')}</td></tr>
 <tr><td>Outbox chờ gửi lại</td><td>${outbox.length}</td></tr>
 <tr><td>GitHub webhook</td><td>${GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT (chưa đặt GITHUB_WEBHOOK_SECRET)'}</td></tr>
+<tr><td>GitHub Issues sync</td><td>${GITHUB_ISSUES_SYNC_ENABLED ? `BẬT — repo ${esc(GITHUB_ISSUES_REPO)}, ${issueSyncStatus().linked.length} Issue đã liên kết, ${issueSyncQueue.length} mục chờ${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — tạo/đóng/mở Issue sẽ vào hàng chờ)'}` : 'TẮT (GITHUB_ISSUES_SYNC_ENABLED=0)'}</td></tr>
 <tr><td>Digest sáng</td><td>${DIGEST_ENABLED ? `BẬT — ${esc(DIGEST_TIME)} (đã đăng gần nhất: ${esc(lastDigestDate || 'chưa')})` : 'TẮT'}</td></tr>
 ${wdRows}
 </table>
@@ -3270,6 +3611,7 @@ ${wdRows}
       if (lockErr) return json(res, 409, { ok: false, error: lockErr });
     }
     const next = { ...(msg.task || { assignee: null, status: 'todo' }) };
+    const prevStatus = next.status;
     if (data.assignee !== undefined) {
       if (data.assignee !== null && !TASK_ASSIGNEES.includes(data.assignee)) {
         return json(res, 400, { ok: false, error: 'assignee must be muse-a|muse-b|muse-c|martin|null' });
@@ -3298,6 +3640,11 @@ ${wdRows}
     msg.task = next;
     persistMessages();
     appendAudit({ action: 'task.update', sender: data.sender || null, messageId: msg.id, source: 'api', ip: clientIp(req) });
+    // Đồng bộ 2 chiều (v1.11.0): task sang done thì Issue liên kết tự
+    // đóng, task từ done mở lại thì Issue tự mở lại (fire-and-forget).
+    if (data.status !== undefined && prevStatus !== next.status) {
+      syncIssueState(msg, prevStatus, next.status).catch((e) => console.error('[issues] sync error:', e.message));
+    }
     return json(res, 200, { ok: true, message: msg });
   }
 
@@ -3328,6 +3675,53 @@ ${wdRows}
       return json(res, code, { ok: false, error: r.error });
     }
     return json(res, 200, { ok: true, message: r.message, ...(r.tookOver ? { tookOver: true } : {}), ...(r.prevHolder ? { prevHolder: r.prevHolder } : {}) });
+  }
+
+  // Đồng bộ Issues 2 chiều (v1.11.0): POST /api/messages/:id/sync-issue
+  // {"token","sender"?} — tạo Issue GitHub cho task (idempotent: task
+  // đã có Issue thì trả lại link cũ, không tạo trùng). Chưa có
+  // GITHUB_TOKEN hoặc GitHub lỗi thì trả 202 + queued:true (đã đưa vào
+  // hàng chờ, task hiện cờ "chờ đồng bộ"). Tính năng tắt thì trả 503.
+  const syncIssuePatch = p.match(/^\/api\/messages\/(\d+)\/sync-issue$/);
+  if (syncIssuePatch && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    if (!GITHUB_ISSUES_SYNC_ENABLED) return json(res, 503, { ok: false, error: 'đồng bộ Issues đang tắt (GITHUB_ISSUES_SYNC_ENABLED=0)' });
+    const msg = messages.find((m) => m.id === Number(syncIssuePatch[1]));
+    if (!msg) return json(res, 404, { ok: false, error: 'message not found' });
+    if (!msg.task) return json(res, 400, { ok: false, error: `tin #${msg.id} không phải task` });
+    const r = await createIssueForTask(msg);
+    if (r.ok) return json(res, 200, { ok: true, message: msg, issue: r.issue, ...(r.already ? { already: true } : {}) });
+    return json(res, 202, { ok: true, queued: true, message: msg, error: r.error });
+  }
+
+  // GET /api/issues — liệt kê Issue đã liên kết (từ task) + hàng chờ
+  // đồng bộ + cấu hình (chỉ báo có token hay không, không lộ token).
+  if (p === '/api/issues' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, ...issueSyncStatus() });
+  }
+
+  // POST /api/issues/retry {"token"} — thử lại toàn bộ hàng chờ tạo/
+  // đóng/mở Issue (cần GITHUB_TOKEN; chưa có thì trả 503).
+  if (p === '/api/issues/retry' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = await retryIssueSync();
+    if (!r.ok) return json(res, 503, { ok: false, error: r.error });
+    return json(res, 200, { ok: true, results: r.results, pending: r.pending });
   }
 
   // Read receipt (v1.5.0): POST /api/messages/:id/read {"token","reader"}
@@ -3426,6 +3820,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Task lifecycle v1.9.0: claim → doing → review → done (POST /api/messages/:id/claim|release, khóa hết hạn sau ${TASK_LOCK_TIMEOUT_MINUTES} phút không hoạt động, nhắc task quá hạn / hạn hôm nay ${TASK_REMINDER_ENABLED ? 'BẬT' : 'TẮT'})`);
   console.log(`Duyệt nhanh PR trên Telegram v1.9.0: BẬT — nút ✅ Duyệt / 🔀 Merge dưới tin PR, lệnh /approve / /merge${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — nút Merge chỉ ghi quyết định + trả link merge tay)'}`);
   console.log(`Review chéo PR tự động + hàng đợi ưu tiên v1.10.0: ${AUTO_REVIEW_ENABLED ? 'BẬT' : 'TẮT'} — webhook PR opened/synchronize → Muse khác tác giả đăng review lên thread (GET /api/reviews); task có priority high|medium|low, vote bằng POST /api/messages/:id/vote hoặc /vote <id> trên Telegram, xem ?view=queue (GET /api/queue, GET /api/ideas)`);
+  console.log(`Đồng bộ Issues 2 chiều v1.11.0: ${GITHUB_ISSUES_SYNC_ENABLED ? `BẬT — repo ${GITHUB_ISSUES_REPO}, label ${GITHUB_ISSUES_LABEL}${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — tạo/đóng/mở Issue sẽ vào hàng chờ đồng bộ)'}` : 'TẮT (GITHUB_ISSUES_SYNC_ENABLED=0)'}`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
