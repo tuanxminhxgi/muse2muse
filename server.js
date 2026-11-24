@@ -206,6 +206,37 @@
 //      /health, /api/status và panel board thêm mục issues (chỉ báo có
 //      token hay không, không bao giờ lộ token).
 //
+// v1.12.0 (Muse B: tối ưu thread — tin #253/#254 — Martin yêu cầu dọn
+// thread (tin đã đọc + đã xử lý xong thì chuyển sang lịch sử), Muse A
+// giao cho Muse B ở #254):
+//   1) Lưu trữ tin đã đọc + đã xử lý xong: mỗi tin có cờ archived
+//      (+ archivedAt) lưu ngay trên tin, persistMessages ghi lại
+//      messages.jsonl như cờ pinned (v1.7.0). Lưu trữ không xóa dữ
+//      liệu: tin đã lưu trữ vẫn đọc, tìm và khôi phục được.
+//   2) Lưu trữ hàng loạt: POST /api/messages/archive-read {"token"}
+//      lưu trữ 1 lần mọi tin đủ điều kiện: task đã done, hoặc tin
+//      thường đã có Muse khác người gửi xác nhận đọc — và chỉ khi tin
+//      đã cũ hơn 24h và không ghim (nhờ ngưỡng 24h nên yêu cầu mới nhất
+//      của Martin, như tin #253, không bao giờ bị lưu trữ nhầm). Không
+//      bao giờ lưu trữ:
+//      tin trong 24h qua, task chưa done, tin chưa ai đọc, tin đã lưu
+//      trữ rồi. Trả số lượng đã lưu trữ + danh sách bỏ qua kèm lý do.
+//   3) Thread mặc định chỉ hiện tin đang hoạt động (chưa lưu trữ);
+//      chế độ xem Lịch sử (?view=history, kèm tìm theo từ khóa q +
+//      người gửi fsender) liệt kê tin đã lưu trữ, mới nhất trước, đủ
+//      nội dung + nút Khôi phục. API: GET /api/history?token=&q=&
+//      sender= (cùng dữ liệu với ?view=history) và GET /api/messages?
+//      archived=true (mặc định archived=false = chỉ tin đang hoạt
+//      động; archived=all = tất cả). Khôi phục 1 tin: POST
+//      /api/messages/:id/unarchive {"token"}.
+//   4) Thao tác trên từng tin: nút Lưu trữ / Khôi phục ngay dưới tin
+//      (POST /api/messages/:id/archive {"token"} — kiểm tra đủ điều
+//      kiện rồi mới lưu, chưa đủ thì trả 400 kèm lý do; form trên board
+//      POST /b/<token>/archive|unarchive|archive-read làm tương tự
+//      không cần JS). Nút "Lưu trữ tin đã đọc xong" ở đầu thread gọi
+//      archive-read hàng loạt. Tóm tắt lăn, digest và các endpoint cũ
+//      giữ nguyên, tương thích ngược.
+//
 // Ghi chú: lúc làm v1.11.0, nội dung repo lại bị gắn cờ execution-risk
 // (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
 // board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
@@ -223,7 +254,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.11.0';
+const VERSION = '1.12.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -428,6 +459,7 @@ function buildRollingSummary() {
       + (lastDecision ? ` Quyết định gần nhất: #${lastDecision.id} ${lastDecision.sender}: ${lastDecision.text}` : ' Chưa có quyết định nào.');
   return {
     total,
+    archived: archivedMessages().length,
     latestId: latest ? latest.id : 0,
     latestTs: latest ? latest.ts : null,
     latestSender: latest ? latest.sender : null,
@@ -1815,6 +1847,98 @@ function setPinned(id, pinned) {
   return msg;
 }
 
+// ---------- Lịch sử / lưu trữ thread (v1.12.0) ----------
+// Tin đã đọc + đã xử lý xong thì chuyển sang Lịch sử để thread gọn:
+// cờ archived (+ archivedAt) lưu ngay trên tin, persistMessages ghi lại
+// messages.jsonl như cờ pinned (v1.7.0). Tin cũ không có cờ này vẫn đọc
+// bình thường, coi như đang hoạt động. Lưu trữ không xóa dữ liệu: tin
+// đã lưu trữ vẫn đọc, tìm (GET /api/history, ?view=history) và khôi
+// phục được (POST /api/messages/:id/unarchive).
+// Tin đủ điều kiện lưu trữ khi: chưa lưu trữ, không ghim, đã cũ hơn
+// ARCHIVE_MIN_AGE_MS (24h — nên yêu cầu mới nhất của Martin, như tin
+// #253, không bao giờ bị lưu trữ nhầm), và đã xử lý xong: task thì
+// status phải done, tin thường thì đã có ít nhất 1 Muse khác người gửi
+// xác nhận đọc (read_by — người gửi tự động có read_by nên không tính).
+// Tin hệ thống (github/bridge) cũng theo quy tắc tin thường.
+const ARCHIVE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+function archiveEligibility(m, now = Date.now()) {
+  if (m.archived) return { ok: false, reason: 'already-archived' };
+  if (m.pinned) return { ok: false, reason: 'pinned' };
+  const ageMs = now - new Date(m.ts || 0).getTime();
+  if (Number.isNaN(ageMs) || ageMs < ARCHIVE_MIN_AGE_MS) return { ok: false, reason: 'too-recent' };
+  if (m.task) {
+    if (m.task.status !== 'done') return { ok: false, reason: 'task-not-done' };
+  } else if (!Array.isArray(m.read_by) || !m.read_by.some((r) => r !== m.sender)) {
+    // Người gửi tự động có read_by (xem addMessage) nên chỉ tính là đã
+    // đọc khi có Muse khác người gửi xác nhận đọc.
+    return { ok: false, reason: 'not-read' };
+  }
+  return { ok: true };
+}
+function activeMessages() {
+  return messages.filter((m) => !m.archived);
+}
+function archivedMessages() {
+  return messages.filter((m) => m.archived);
+}
+// Lưu trữ / khôi phục 1 tin. setArchived(id, true) kiểm tra đủ điều
+// kiện rồi mới lưu (chưa đủ thì trả {ok:false, reason}); khôi phục thì
+// luôn được khi tin đang lưu trữ. Trả {ok, message} hoặc
+// {ok:false, code, error/reason}.
+function setArchived(id, archived, source) {
+  const msg = messages.find((m) => m.id === id);
+  if (!msg) return { ok: false, code: 'not_found', error: 'message not found' };
+  if (archived) {
+    const check = archiveEligibility(msg);
+    if (!check.ok) return { ok: false, code: 'not_eligible', reason: check.reason, error: `tin #${id} chưa đủ điều kiện lưu trữ (${check.reason})` };
+    msg.archived = true;
+    msg.archivedAt = new Date().toISOString();
+  } else {
+    if (!msg.archived) return { ok: false, code: 'not_archived', error: `tin #${id} không nằm trong Lịch sử` };
+    delete msg.archived;
+    delete msg.archivedAt;
+  }
+  persistMessages();
+  appendAudit({ action: archived ? 'message.archive' : 'message.unarchive', sender: null, messageId: msg.id, source: source || 'api' });
+  broadcastMessage(msg);
+  return { ok: true, message: msg };
+}
+// Lưu trữ hàng loạt (v1.12.0): quét toàn bộ thread, lưu mọi tin đủ điều
+// kiện, trả danh sách đã lưu + danh sách bỏ qua kèm lý do từng tin.
+function archiveReadMessages(source) {
+  const now = Date.now();
+  const archived = [];
+  const skipped = [];
+  for (const m of messages) {
+    const check = archiveEligibility(m, now);
+    if (!check.ok) { skipped.push({ id: m.id, reason: check.reason }); continue; }
+    m.archived = true;
+    m.archivedAt = new Date().toISOString();
+    archived.push(m.id);
+  }
+  if (archived.length > 0) {
+    persistMessages();
+    appendAudit({ action: 'message.archive-read', sender: null, messageId: null, source: source || 'api' });
+    for (const id of archived) {
+      const msg = messages.find((m) => m.id === id);
+      if (msg) broadcastMessage(msg);
+    }
+  }
+  return { archived, skipped };
+}
+// Tra cứu Lịch sử (v1.12.0): chỉ tin đã lưu trữ, mới nhất trước; lọc
+// theo từ khóa q (không phân biệt hoa thường) và người gửi sender —
+// dùng chung cho board ?view=history và GET /api/history nên kết quả
+// API và board luôn khớp nhau (cùng mẫu với filterSaved v1.8.0).
+function filterHistory({ q = '', sender = '' } = {}) {
+  const needle = String(q || '').trim().toLowerCase();
+  return archivedMessages().filter((m) => {
+    if (sender && m.sender !== sender) return false;
+    if (needle && !String(m.text || '').toLowerCase().includes(needle)) return false;
+    return true;
+  }).slice().reverse();
+}
+
 // ---------- Bình chọn + hàng đợi ưu tiên (v1.10.0) ----------
 // Vote lưu ngay trên tin: voted_by = [voter...] (mỗi người tối đa 1 lần,
 // bấm lại là rút vote). Tin cũ không có voted_by thì coi như 0 vote.
@@ -2325,11 +2449,17 @@ function renderActions(m) {
   const issueBtn = (m.task && !m.task.issue)
     ? ` <button type="button" data-action="sync-issue" data-id="${m.id}" title="Tạo Issue trên GitHub cho task #${m.id} (chưa có GITHUB_TOKEN thì đưa vào hàng chờ)">Tạo Issue</button>`
     : '';
+  // Lưu trữ / khôi phục (v1.12.0): nút JS gọi POST
+  // /api/messages/:id/archive|unarchive; form không-JS nằm trong
+  // renderRow (như nút Ghim). Tin đã lưu trữ thì chỉ còn nút Khôi phục.
+  const archiveBtn = m.archived
+    ? ` <button type="button" data-action="unarchive" data-id="${m.id}" title="Khôi phục tin #${m.id} về thread">Khôi phục</button>`
+    : ` <button type="button" data-action="archive" data-id="${m.id}" title="Lưu trữ tin #${m.id} vào Lịch sử (chỉ khi đã đọc + đã xử lý xong và cũ hơn 24h)">Lưu trữ</button>`;
   return `<div class="msg-actions" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">`
     + `<button type="button" data-action="reply" data-id="${m.id}" title="Trả lời tin #${m.id} (điền vào form bên dưới)">Trả lời</button>`
     + ` <button type="button" data-action="read" data-id="${m.id}" title="Đánh dấu đã đọc (theo sender đang chọn trong form)">Đã đọc</button>`
     + ` <button type="button" data-action="vote" data-id="${m.id}" title="Bình chọn / rút vote cho tin #${m.id} (theo sender đang chọn trong form)">👍 Bình chọn${voteCount(m) ? ` (${voteCount(m)})` : ''}</button>`
-    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect + claimBtns + issueBtn
+    + (statusBtns ? ` ${statusBtns}` : '') + assignSelect + claimBtns + issueBtn + archiveBtn
     + ` <button type="button" data-action="copy" data-id="${m.id}" title="Copy link tới tin #${m.id}">Copy link</button>`
     + `</div>`;
 }
@@ -2357,11 +2487,19 @@ function renderRow(m) {
     <button type="submit" style="font-size:12px">👍 Bình chọn${voteCount(m) ? ` (${voteCount(m)})` : ''}</button>
   </form>`;
   const pinMark = m.pinned ? ` <span style="background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 6px;font-size:12px">📌 đã ghim</span>` : '';
+  // Lưu trữ không cần JS (v1.12.0): form Lưu trữ / Khôi phục, như form
+  // Ghim/Bỏ ghim ở trên; có JS thì nút trong thao tác nhanh làm việc
+  // này mà không reload trang.
+  const archiveMark = m.archived ? ` <span style="background:#e5e7eb;border:1px solid #9ca3af;border-radius:4px;padding:1px 6px;font-size:12px">📦 đã lưu trữ${m.archivedAt ? ` · ${esc(m.archivedAt.slice(0, 10))}` : ''}</span>` : '';
+  const archiveForm = `<form method="POST" action="/b/${esc(BRIDGE_TOKEN)}/${m.archived ? 'unarchive' : 'archive'}" style="display:inline;margin:0">
+    <input type="hidden" name="id" value="${m.id}">
+    <button type="submit" style="font-size:12px">${m.archived ? 'Khôi phục' : 'Lưu trữ'}</button>
+  </form>`;
   const body = `<div style="white-space:pre-wrap;margin-top:4px">${type}${esc(m.text)}</div>${githubDetails(m)}`;
   return `
     <div id="msg-${m.id}" style="margin:0 0 10px;padding:10px;border:1px solid #ddd;border-radius:8px">
-      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${voteBadge(m)}${mentionBadge(m)}${pinMark}
-      <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span> ${pinBtn} ${voteForm}
+      <b>#${m.id} ${esc(m.sender)}</b>${taskBadge(m)}${voteBadge(m)}${mentionBadge(m)}${pinMark}${archiveMark}
+      <span style="color:#888;font-size:12px">${esc(m.ts)} · ${esc(m.source)}</span> ${pinBtn} ${voteForm} ${archiveForm}
       ${reply}
       ${body}
       ${readBadge(m)}
@@ -2442,7 +2580,9 @@ function renderStatusPanel(s) {
 function renderTopSections() {
   const pinned = messages.filter((m) => m.pinned);
   const assigned = openTasks().filter((m) => m.task.assignee).slice(-10);
-  const decisions = messages.filter((m) => m.type === 'decision').slice(-10).reverse();
+  // Lịch sử (v1.12.0): quyết định đã lưu trữ thì không liệt kê ở đây
+  // (link #msg-<id> sẽ trỏ tới tin không còn trong thread).
+  const decisions = messages.filter((m) => m.type === 'decision' && !m.archived).slice(-10).reverse();
   const link = (m, label) => `<li><a href="#msg-${m.id}">#${m.id}</a> ${label} <span style="color:#888;font-size:12px">${esc(m.ts.slice(0, 10))} · ${esc(m.sender)}</span></li>`;
   let html = '';
   if (pinned.length > 0) {
@@ -2546,6 +2686,31 @@ ${savedFilterForm(filters)}
 ${rows}`;
 }
 
+function historyFilterForm(f) {
+  const opt = (value, current, label) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
+  return `<form method="GET" action="/b/${esc(BRIDGE_TOKEN)}" style="margin:0 0 16px">
+  <input type="hidden" name="view" value="history">
+  <label>Tìm: <input name="q" type="text" value="${esc(f.q)}" placeholder="từ khóa trong tin…" style="width:200px"></label>
+  <label> Người gửi: <select name="fsender">${opt('', f.sender, '— tất cả —')}${SENDERS.map((s) => opt(s, f.sender, s)).join('')}</select></label>
+  <button type="submit">Tìm</button>
+  <a href="/b/${esc(BRIDGE_TOKEN)}?view=history">Xóa lọc</a>
+</form>`;
+}
+
+// Chế độ xem "Lịch sử" (v1.12.0): toàn bộ tin đã lưu trữ, mới nhất
+// trước, hiện đủ nội dung bằng renderRow (kèm nút Khôi phục), mỗi tin
+// có link #msg-<id> về thread. Lưu trữ không xóa dữ liệu nên tin ở đây
+// vẫn đọc, tìm và khôi phục được. Trống thì báo rõ, không giấu.
+function renderHistory(filters) {
+  const list = filterHistory(filters);
+  const rows = list.map(renderRow).join('')
+    || '<p><i>Chưa có tin nào trong Lịch sử. Tin đã đọc + đã xử lý xong và cũ hơn 24h sẽ vào đây khi bấm "Lưu trữ tin đã đọc xong" hoặc nút Lưu trữ dưới từng tin.</i></p>';
+  return `<h2>🗄️ Lịch sử (${list.length} tin đã lưu trữ)</h2>
+<p style="color:#888;font-size:12px">Tin đã đọc + đã xử lý xong, cũ hơn 24h. Bấm Khôi phục để đưa tin về lại thread.</p>
+${historyFilterForm(filters)}
+${rows}`;
+}
+
 // Hàng đợi ưu tiên (v1.10.0): task đang mở xếp theo ưu tiên (high trước)
 // rồi số vote, rồi id; tiếp theo là ideas có vote xếp theo vote. Mỗi mục
 // link về tin gốc (#msg-<id>) trong thread.
@@ -2577,7 +2742,8 @@ ${q.ideas.length > 0 ? `<ul>${q.ideas.map(ideaRow).join('')}</ul>` : '<p><i>Chư
 async function renderPage(query) {
   const view = query.get('view') === 'kanban' ? 'kanban'
     : query.get('view') === 'saved' ? 'saved'
-    : query.get('view') === 'queue' ? 'queue' : 'thread';
+    : query.get('view') === 'queue' ? 'queue'
+    : query.get('view') === 'history' ? 'history' : 'thread';
   const filters = {
     assignee: query.get('fassignee') || '',
     status: query.get('fstatus') || '',
@@ -2588,19 +2754,37 @@ async function renderPage(query) {
     sender: query.get('fsender') || '',
     kind: ['pinned', 'decision'].includes(query.get('fkind')) ? query.get('fkind') : 'all',
   };
+  const historyFilters = {
+    q: query.get('q') || '',
+    sender: query.get('fsender') || '',
+  };
   const status = await getBoardStatus();
-  const rows = messages.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B và Muse C.</i></p>';
-  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`} · ${view === 'saved' ? '<b>📌 Đã ghim</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=saved">📌 Đã ghim</a>`} · ${view === 'queue' ? '<b>⏫ Hàng đợi</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=queue">⏫ Hàng đợi</a>`}</p>`;
+  // Thread mặc định (v1.12.0) chỉ hiện tin đang hoạt động (chưa lưu
+  // trữ); tin đã lưu trữ xem ở ?view=history.
+  const active = activeMessages();
+  const archived = archivedMessages();
+  const rows = active.slice(-100).map(renderRow).join('') || '<p><i>Chưa có tin nhắn nào. Martin hãy gửi tin đầu tiên từ Telegram, hoặc Muse A hãy chào Muse B và Muse C.</i></p>';
+  const viewToggle = `<p>Chế độ xem: ${view === 'thread' ? '<b>Thread</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}">Thread</a>`} · ${view === 'kanban' ? '<b>Kanban</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=kanban">Kanban</a>`} · ${view === 'saved' ? '<b>📌 Đã ghim</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=saved">📌 Đã ghim</a>`} · ${view === 'queue' ? '<b>⏫ Hàng đợi</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=queue">⏫ Hàng đợi</a>`} · ${view === 'history' ? '<b>🗄️ Lịch sử</b>' : `<a href="/b/${esc(BRIDGE_TOKEN)}?view=history">🗄️ Lịch sử (${archived.length})</a>`}</p>`;
   const main = view === 'kanban'
     ? `${filterForm(filters)}${renderKanban(filters)}`
     : view === 'saved'
       ? renderSaved(savedFilters)
       : view === 'queue'
         ? renderQueue()
-        : `<h2>Thread (<span id="thread-count">${messages.length}</span> tin)</h2>
+        : view === 'history'
+          ? renderHistory(historyFilters)
+          : `<h2>Thread (<span id="thread-count">${active.length}</span> tin)</h2>
+<p style="color:#888;font-size:12px">Đã lưu trữ: ${archived.length} tin — <a href="/b/${esc(BRIDGE_TOKEN)}?view=history">xem Lịch sử</a>. Tin đã đọc + đã xử lý xong và cũ hơn 24h sẽ được lưu trữ khi bấm nút dưới đây (hoặc nút Lưu trữ dưới từng tin).</p>
+<form method="POST" action="/b/${esc(BRIDGE_TOKEN)}/archive-read" style="margin:0 0 12px">
+  <button type="submit">Lưu trữ tin đã đọc xong</button>
+</form>
 <div id="thread">
 ${rows}
 </div>`;
+  // Command palette (Ctrl+K) chỉ tìm trong các tin đang hiện trên trang:
+  // ở Lịch sử thì tìm trong tin đã lưu trữ, còn lại thì trong tin đang
+  // hoạt động — khỏi nhảy tới tin không có trên trang.
+  const paletteIndex = view === 'history' ? filterHistory(historyFilters) : active;
 
   return `<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2620,11 +2804,11 @@ html{scroll-behavior:smooth}
 ${renderStatusPanel(status)}
 <p>Presence: ${presenceStatus().map((p) => `${p.muse} ${p.online ? 'online' : (p.agoMinutes === null ? 'chưa check-in' : 'online ' + p.agoMinutes + ' phút trước')}`).join(' · ')}</p>
 <p>Tóm tắt: ${esc(buildRollingSummary().text)}</p>
-${view === 'saved' ? '' : renderWhatsNew()}
+${view === 'saved' || view === 'history' ? '' : renderWhatsNew()}
 <p>Đang ở đây: <span id="presence-avatars">${renderPresenceAvatars()}</span></p>
 <p id="typing-line" style="color:#888;font-size:13px;min-height:18px;margin:4px 0"></p>
 <p>Auto-deploy: ${AUTO_DEPLOY_ENABLED && GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT'}</p>
-${view === 'saved' ? '' : renderTopSections()}
+${view === 'saved' || view === 'history' ? '' : renderTopSections()}
 <p><b>Hướng dẫn cho Muse:</b> đọc toàn bộ thread dưới đây, rồi trả lời bằng form bên dưới với đúng sender của bạn (muse-a, muse-b hoặc muse-c). Chỉ trả lời khi có tin mới cần bạn xử lý, hoặc khi Martin giao việc. Đừng lặp lại tin đã có.</p>
 ${viewToggle}
 ${main}
@@ -2686,8 +2870,8 @@ ${main}
 </form>
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
-<script>var MSG_INDEX = ${JSON.stringify(messages.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ)</p>
+<script>var MSG_INDEX = ${JSON.stringify(paletteIndex.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ) · POST /api/messages/archive-read {"token"} (lưu trữ hàng loạt tin đã đọc xong) · POST /api/messages/:id/archive {"token"} (lưu trữ 1 tin) · POST /api/messages/:id/unarchive {"token"} (khôi phục tin đã lưu trữ) · GET /api/history?token=<redacted>&amp;q=&amp;sender= (tin đã lưu trữ, tìm theo từ khóa + người gửi) · GET /api/messages?archived=true (chỉ tin đã lưu trữ; archived=all = tất cả) · Board: ?view=history&amp;q=&amp;fsender= (Lịch sử + tìm kiếm)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -2741,6 +2925,12 @@ ${main}
         h += ' <button type="button" data-action="sync-issue" data-id="' + m.id + '" title="Tạo Issue trên GitHub cho task #' + m.id + ' (chưa có GITHUB_TOKEN thì đưa vào hàng chờ)">Tạo Issue</button>';
       }
     }
+    // Lưu trữ / khôi phục (v1.12.0): nút JS gọi POST
+    // /api/messages/:id/archive|unarchive; form không-JS nằm trong
+    // rowHtml (như nút Ghim). Tin đã lưu trữ thì chỉ còn nút Khôi phục.
+    h += m.archived
+      ? ' <button type="button" data-action="unarchive" data-id="' + m.id + '" title="Khôi phục tin #' + m.id + ' về thread">Khôi phục</button>'
+      : ' <button type="button" data-action="archive" data-id="' + m.id + '" title="Lưu trữ tin #' + m.id + ' vào Lịch sử (chỉ khi đã đọc + đã xử lý xong và cũ hơn 24h)">Lưu trữ</button>';
     h += ' <button type="button" data-action="copy" data-id="' + m.id + '" title="Copy link tới tin #' + m.id + '">Copy link</button></div>';
     return h;
   }
@@ -2774,6 +2964,12 @@ ${main}
       + '<input type="hidden" name="id" value="' + m.id + '">'
       + '<input type="hidden" name="pinned" value="' + (m.pinned ? '0' : '1') + '">'
       + '<button type="submit" style="font-size:12px">' + (m.pinned ? 'Bỏ ghim' : 'Ghim') + '</button></form>';
+    // Lưu trữ không cần JS (v1.12.0): form Lưu trữ / Khôi phục, như form
+    // Ghim/Bỏ ghim ở trên.
+    var archiveMark = m.archived ? ' <span style="background:#e5e7eb;border:1px solid #9ca3af;border-radius:4px;padding:1px 6px;font-size:12px">📦 đã lưu trữ' + (m.archivedAt ? ' · ' + escHtml(m.archivedAt.slice(0, 10)) : '') + '</span>' : '';
+    var archiveForm = '<form method="POST" action="/b/' + TOKEN + '/' + (m.archived ? 'unarchive' : 'archive') + '" style="display:inline;margin:0">'
+      + '<input type="hidden" name="id" value="' + m.id + '">'
+      + '<button type="submit" style="font-size:12px">' + (m.archived ? 'Khôi phục' : 'Lưu trữ') + '</button></form>';
     var gh = '';
     if (m.github) {
       if (m.github.event === 'push') {
@@ -2797,8 +2993,8 @@ ${main}
         gh = '<details style="margin-top:6px"><summary style="cursor:pointer">Release ' + escHtml(m.github.tag || '') + ' — ' + escHtml(m.github.title || '') + '</summary><div>Trạng thái: ' + escHtml(m.github.action || '') + (m.github.url ? ' · <a href="' + escHtml(m.github.url) + '">' + escHtml(m.github.url) + '</a>' : '') + '</div></details>';
       }
     }
-    return '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge + pinMark +
-      ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span> ' + pinBtn +
+    return '<b>#' + m.id + ' ' + escHtml(m.sender) + '</b>' + badge + pinMark + archiveMark +
+      ' <span style="color:#888;font-size:12px">' + escHtml(m.ts) + ' · ' + escHtml(m.source) + '</span> ' + pinBtn + ' ' + archiveForm +
       reply +
       '<div style="white-space:pre-wrap;margin-top:4px">' + type + escHtml(m.text) + '</div>' + gh +
       read + actionsHtml(m);
@@ -2916,6 +3112,19 @@ ${main}
           if (!r.ok) { alert('Không tạo được Issue: ' + (r.json.error || r.status)); return; }
           if (r.json.queued) { alert('Chưa có GITHUB_TOKEN — đã đưa task vào hàng chờ đồng bộ, sẽ tạo Issue khi có token (POST /api/issues/retry).'); }
           refreshRow(id); refreshWhatsNew();
+        });
+      } else if (action === 'archive' || action === 'unarchive') {
+        // Lưu trữ / khôi phục (v1.12.0): xong thì tin không còn thuộc
+        // chế độ xem hiện tại nên gỡ luôn hàng đó khỏi trang (không
+        // gọi refreshRow vì /api/messages mặc định chỉ trả tin đang
+        // hoạt động — tin đã lưu trữ sẽ không trả về).
+        api('/api/messages/' + id + '/' + action, 'POST', {}).then(function (r) {
+          if (!r.ok) { alert('Không ' + (action === 'archive' ? 'lưu trữ' : 'khôi phục') + ' được: ' + (r.json.error || r.status)); return; }
+          var row = document.getElementById('msg-' + id);
+          if (row) row.remove();
+          var count = document.getElementById('thread-count');
+          if (count && action === 'archive') count.textContent = String(Math.max(0, Number(count.textContent || '0') - 1));
+          refreshWhatsNew();
         });
       } else if (action === 'copy') {
         var link = location.origin + location.pathname + '#msg-' + id;
@@ -3082,8 +3291,13 @@ function filterMessages(url) {
   const forMuse = url.searchParams.get('for') || '';
   const unreadBy = url.searchParams.get('unread_by') || '';
   const type = url.searchParams.get('type') || '';
+  // Lịch sử (v1.12.0): mặc định chỉ tin đang hoạt động (chưa lưu trữ);
+  // archived=true = chỉ tin đã lưu trữ, archived=all = tất cả.
+  const archived = url.searchParams.get('archived') || '';
   return messages.filter((m) => {
     if (m.id <= since) return false;
+    if (archived === 'true' || archived === '1') { if (!m.archived) return false; }
+    else if (archived !== 'all' && m.archived) return false;
     if (sender && m.sender !== sender) return false;
     if (q && !(String(m.text).toLowerCase().includes(q) || String(m.sender).toLowerCase().includes(q))) return false;
     if (status && m.task?.status !== status) return false;
@@ -3146,6 +3360,7 @@ const server = http.createServer(async (req, res) => {
         staleLocks: messages.filter((m) => m.task?.lockedBy && lockStale(m.task)).length,
       },
       issues: issueSyncStatus(),
+      history: { active: activeMessages().length, archived: archivedMessages().length },
     });
   }
 
@@ -3202,6 +3417,7 @@ ${wdRows}
       presence: presenceStatus(),
       unread: unreadCounts(),
       summary: buildRollingSummary(),
+      history: { active: activeMessages().length, archived: archivedMessages().length },
     });
   }
 
@@ -3247,6 +3463,39 @@ ${wdRows}
     if (!r.ok) { res.writeHead(r.code === 'not_found' ? 404 : 400); return res.end(r.error); }
     console.log(`[mailbox] ${r.voted ? 'voted' : 'unvoted'} #${id} by ${voter} (👍 ${voteCount(r.message)})`);
     res.writeHead(302, { location: `/b/${BRIDGE_TOKEN}` });
+    return res.end();
+  }
+
+  // Lưu trữ / khôi phục 1 tin từ form trên board (v1.12.0): POST
+  // /b/<token>/archive|unarchive với id, xong redirect về board
+  // (archive → thread, unarchive → Lịch sử). Lưu trữ kiểm tra đủ điều
+  // kiện như API (chưa đủ thì trả 400 kèm lý do, không lưu).
+  const archiveForm = p.match(new RegExp(`^/b/${BRIDGE_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(archive|unarchive)$`));
+  if (archiveForm && req.method === 'POST') {
+    if (tokenExpired()) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }); return res.end(TOKEN_EXPIRED_MSG); }
+    if (rateLimited(req)) { res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('rate limited'); }
+    const body = new URLSearchParams(await readBody(req));
+    const id = Number(body.get('id'));
+    if (!Number.isInteger(id) || id <= 0) { res.writeHead(400); return res.end('id không hợp lệ'); }
+    const archive = archiveForm[1] === 'archive';
+    const r = setArchived(id, archive, 'web');
+    if (!r.ok) {
+      if (r.code === 'not_found') { res.writeHead(404); return res.end('message not found'); }
+      res.writeHead(400); return res.end(r.error);
+    }
+    console.log(`[mailbox] ${archive ? 'archived' : 'unarchived'} #${id}`);
+    res.writeHead(302, { location: archive ? `/b/${BRIDGE_TOKEN}` : `/b/${BRIDGE_TOKEN}?view=history` });
+    return res.end();
+  }
+
+  // Lưu trữ hàng loạt từ form trên board (v1.12.0): POST
+  // /b/<token>/archive-read, xong redirect sang Lịch sử để xem kết quả.
+  if (p === `/b/${BRIDGE_TOKEN}/archive-read` && req.method === 'POST') {
+    if (tokenExpired()) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }); return res.end(TOKEN_EXPIRED_MSG); }
+    if (rateLimited(req)) { res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('rate limited'); }
+    const r = archiveReadMessages('web');
+    console.log(`[mailbox] archive-read: ${r.archived.length} archived, ${r.skipped.length} skipped`);
+    res.writeHead(302, { location: `/b/${BRIDGE_TOKEN}?view=history` });
     return res.end();
   }
 
@@ -3519,6 +3768,68 @@ ${wdRows}
       q: url.searchParams.get('q') || '', sender: url.searchParams.get('sender') || '',
       decisions: list,
     });
+  }
+
+  // Lịch sử (v1.12.0): GET /api/history?token=&q=&sender=&limit= —
+  // tin đã lưu trữ, mới nhất trước, tìm theo từ khóa q (không phân
+  // biệt hoa thường) và người gửi sender; dùng chung filterHistory với
+  // board ?view=history nên kết quả API và board luôn khớp nhau.
+  // GET /api/messages?archived=true trả cùng tập tin qua filterMessages.
+  if (p === '/api/history' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const limitRaw = Number(url.searchParams.get('limit') || 100);
+    const limit = Math.min(Math.max(limitRaw || 100, 1), 500);
+    const list = filterHistory({
+      q: url.searchParams.get('q') || '',
+      sender: url.searchParams.get('sender') || '',
+    });
+    return json(res, 200, {
+      ok: true, count: list.length,
+      q: url.searchParams.get('q') || '', sender: url.searchParams.get('sender') || '',
+      archived: list.slice(0, limit),
+    });
+  }
+
+  // Lưu trữ hàng loạt (v1.12.0): POST /api/messages/archive-read
+  // {"token"} — lưu trữ 1 lần mọi tin đủ điều kiện (task done, hoặc
+  // tin thường đã có read_by; cũ hơn 24h; không ghim). Trả số tin đã
+  // lưu (archived: [id...]) + danh sách bỏ qua kèm lý do từng tin
+  // (skipped: [{id, reason}]). Không bao giờ xóa dữ liệu.
+  if (p === '/api/messages/archive-read' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = archiveReadMessages('api');
+    console.log(`[mailbox] archive-read: ${r.archived.length} archived, ${r.skipped.length} skipped`);
+    return json(res, 200, { ok: true, archived: r.archived, archivedCount: r.archived.length, skipped: r.skipped, skippedCount: r.skipped.length });
+  }
+
+  // Lưu trữ / khôi phục 1 tin (v1.12.0): POST
+  // /api/messages/:id/archive|unarchive {"token"}. Lưu trữ kiểm tra đủ
+  // điều kiện (chưa đủ thì trả 400 kèm reason: already-archived,
+  // pinned, too-recent, task-not-done, not-read); khôi phục khi tin
+  // không nằm trong Lịch sử thì trả 400. Tin không tồn tại trả 404.
+  const archivePatch = p.match(/^\/api\/messages\/(\d+)\/(archive|unarchive)$/);
+  if (archivePatch && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = setArchived(Number(archivePatch[1]), archivePatch[2] === 'archive', 'api');
+    if (!r.ok) {
+      const code = r.code === 'not_found' ? 404 : 400;
+      return json(res, code, { ok: false, error: r.error, ...(r.reason ? { reason: r.reason } : {}) });
+    }
+    return json(res, 200, { ok: true, message: r.message });
   }
 
   // Heartbeat + catch-up (v1.4.0): POST /api/heartbeat {"token","sender",
@@ -3821,6 +4132,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Duyệt nhanh PR trên Telegram v1.9.0: BẬT — nút ✅ Duyệt / 🔀 Merge dưới tin PR, lệnh /approve / /merge${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — nút Merge chỉ ghi quyết định + trả link merge tay)'}`);
   console.log(`Review chéo PR tự động + hàng đợi ưu tiên v1.10.0: ${AUTO_REVIEW_ENABLED ? 'BẬT' : 'TẮT'} — webhook PR opened/synchronize → Muse khác tác giả đăng review lên thread (GET /api/reviews); task có priority high|medium|low, vote bằng POST /api/messages/:id/vote hoặc /vote <id> trên Telegram, xem ?view=queue (GET /api/queue, GET /api/ideas)`);
   console.log(`Đồng bộ Issues 2 chiều v1.11.0: ${GITHUB_ISSUES_SYNC_ENABLED ? `BẬT — repo ${GITHUB_ISSUES_REPO}, label ${GITHUB_ISSUES_LABEL}${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — tạo/đóng/mở Issue sẽ vào hàng chờ đồng bộ)'}` : 'TẮT (GITHUB_ISSUES_SYNC_ENABLED=0)'}`);
+  console.log(`Lịch sử thread v1.12.0: BẬT — POST /api/messages/archive-read (lưu trữ hàng loạt tin đã đọc xong, cũ hơn 24h), ?view=history (GET /api/history), POST /api/messages/:id/archive|unarchive`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
