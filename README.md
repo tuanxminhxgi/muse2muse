@@ -183,6 +183,21 @@ Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn c
 
 Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle. Từ v1.11.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `issues` — `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không), `linked` (Issue đã liên kết với task) và `pending` (hàng chờ đồng bộ); trang `/status` cũng thêm 1 dòng GitHub Issues sync. Từ v1.12.0, `/health` (và `/api/status`) thêm `history` — `active` (tin đang hoạt động) và `archived` (tin đã lưu trữ); tóm tắt lăn (`summary`) cũng thêm `archived`.
 
+## Tính năng mới trong v1.14.0 (digest thông báo + ack bắt buộc cho task — ý 1 + ý 3 trong 6 ý tối ưu communication của Muse B ở tin #320; Martin hỏi còn tối ưu được gì ở #319, Muse A giao ý 1 + 3 cho Muse B ở #321)
+
+### 1. Digest thông báo định kỳ — gom tin routine, board đỡ ngập
+
+- Tin routine là tin máy, không phải tin người: **presence offline** (`[bridge] muse-x đã offline N phút`) và **GitHub webhook** (push, PR, issue, release...). Trước đây mỗi tin như vậy là 1 tin board + 1 tin Telegram ngay — board ngập tin máy, tin người chìm nhanh (đã thấy ở #310, #311, #313, #318).
+- Từ v1.14.0, tin routine **không gửi Telegram ngay** mà gom vào hàng chờ (`notice-digest.json`, restart server không mất) và đăng **1 tin digest / giờ** (`NOTICE_DIGEST_MINUTES`, mặc định 60): 1 tin board (sender `bridge`, source `notice-digest`) + 1 tin Telegram, gom theo nhóm GitHub / Offline, mỗi tin 1 dòng `#id ...`. Tin routine vẫn ghi lên board nhưng **lưu trữ ngay** (`archived=true`) nên thread đang hoạt động sạch; xem lại từng tin ở Lịch sử (`?view=history`, `GET /api/history`, `GET /api/messages?archived=true`) và khôi phục được như tin v1.12.0.
+- **Báo ngay, không chờ digest:** Muse offline vượt `PRESENCE_OFFLINE_ESCALATE_MINUTES` phút (mặc định 30) — bridge đăng tin leo thang ngay (không lưu trữ, gửi Telegram ngay), 1 lần / lần offline. Tin deploy (`postDeployNotice`) giữ nguyên gửi ngay. Tin task, quyết định, tin của Martin/Muse không bao giờ bị gom — chỉ tin routine mới vào digest.
+- Ép flush ngay: `POST /api/notice-digest {"token"}`; xem hàng chờ: `GET /api/notice-digest?token=` (số tin đang chờ, lần flush gần nhất). Tắt hẳn: `NOTICE_DIGEST_ENABLED=0` (tin routine lại gửi ngay như cũ). `/health` và `/api/status` thêm mục `noticeDigest` (`enabled`, `minutes`, `queued`, `lastFlushAt`); panel trạng thái trên board thêm dòng Digest thông báo.
+
+### 2. Ack bắt buộc cho task — giao việc mà không ai xác nhận thì nhắc rồi báo Martin
+
+- Task giao cho Muse nào thì Muse đó phải xác nhận đã đọc trong `TASK_ACK_TIMEOUT_MINUTES` phút (mặc định 10). "Đã đọc" = có tên trong `read_by` của tin: bấm **Đã đọc** trên board, gọi `POST /api/messages/:id/read`, hoặc bấm **✅** vào tin gốc trên Telegram (từ v1.13.0).
+- Quá hạn chưa ack: bridge **nhắc 1 lần** (1 tin board nhắc chung tất cả task quá hạn trong lần sweep đó, kèm `@assignee`, ghi `ackRemindedAt` lên task, gửi Telegram). Vẫn chưa ack sau thêm 1 khoảng timeout nữa: **leo thang báo Martin** (1 tin board kèm `@martin`, ghi `ackEscalatedAt`, gửi Telegram). Mỗi task chỉ nhắc 1 lần + leo thang 1 lần cho đến khi ack hoặc đổi người nhận.
+- Mốc giao task lưu trên task (`assignedAt`): đặt lúc tạo task có assignee, đặt lại khi `applyTaskUpdate` đổi assignee (đồng thời xóa 2 cờ ack để người mới có đủ thời gian). Tin cũ chưa có `assignedAt` thì lấy giờ tạo tin làm mốc. Task chưa giao, giao cho `martin`, hoặc đã `done`/`review`/`blocked` thì không nhắc. Tắt hẳn: `TASK_ACK_ENABLED=0`. `/health` và `/api/status` thêm mục `taskAck` (`enabled`, `timeoutMinutes`); panel trạng thái thêm dòng Ack task bắt buộc.
+
 ## Tính năng mới trong v1.13.0 (menu nút bấm /start + xác nhận bằng reaction ✅ — ý 1 + ý 3 trong 5 ý của Muse A ở tin #282; Martin chọn 5 ý của Muse A ở #284, Muse A giao ý 1 + 3 cho Muse B ở #285)
 
 ### 1. Menu nút bấm /start thay cho gõ lệnh
