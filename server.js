@@ -281,6 +281,24 @@
 //      Task chưa giao, giao cho martin, hoặc đã done/review/blocked thì
 //      không nhắc. Tin cũ chưa có assignedAt thì lấy giờ tạo tin làm mốc.
 //
+// v1.15.0 (Muse B: ý 3 trong 6 ý ở tin #351 — Martin hỏi còn tối ưu được
+// gì ở #340, Muse A giao ý 3 cho Muse B ở #353):
+//   1) Digest sáng thêm mục "Đã xong 24h qua": task xong trong 24h qua
+//      (mốc task.doneAt, đóng dấu khi task chuyển sang done, xóa khi mở
+//      lại) + PR đã merge trong 24h qua (tin webhook pull_request có
+//      github.merged=true, dự phòng khớp text "(đã merge)"). Không còn
+//      task mở nhưng có việc xong trong 24h thì digest vẫn đăng (trước
+//      đây không có task mở là không đăng gì).
+//   2) Báo cáo tuần: mỗi tuần 1 lần vào WEEKLY_REPORT_DAY lúc
+//      WEEKLY_REPORT_TIME (mặc định thứ 2 08:00, giờ địa phương), tóm tắt
+//      7 ngày qua: task đã xong, PR đã merge, task/idea mới tạo, task còn
+//      mở theo người nhận, quá hạn/cần chú ý. Ghi tuần đã đăng (ngày thứ 2
+//      đầu tuần) vào digest-state.json nên mỗi tuần chỉ đăng 1 lần; server
+//      tắt đúng giờ hẹn thì đăng bù ở tick tiếp theo trong cùng tuần.
+//      Xem trước: GET /api/weekly-report, ép đăng ngay:
+//      POST /api/weekly-report. Tắt hẳn lịch: WEEKLY_REPORT_ENABLED=0
+//      (ép đăng tay vẫn được).
+//
 // Ghi chú: lúc làm v1.11.0, nội dung repo lại bị gắn cờ execution-risk
 // (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
 // board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
@@ -298,7 +316,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.14.0';
+const VERSION = '1.15.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -370,6 +388,16 @@ const PRESENCE_OFFLINE_ESCALATE_MINUTES = Number(process.env.PRESENCE_OFFLINE_ES
 // rồi leo thang báo Martin. TASK_ACK_ENABLED=0 tắt hẳn.
 const TASK_ACK_ENABLED = (process.env.TASK_ACK_ENABLED || 'true').toLowerCase() !== 'false';
 const TASK_ACK_TIMEOUT_MINUTES = Number(process.env.TASK_ACK_TIMEOUT_MINUTES || 10);
+// Báo cáo tuần (v1.15.0, ý 3 ở #351): mỗi tuần 1 lần vào WEEKLY_REPORT_DAY
+// (0=Chủ nhật … 6=Thứ 7, mặc định 1=Thứ 2) lúc WEEKLY_REPORT_TIME (giờ địa
+// phương, mặc định 08:00), tóm tắt 7 ngày qua. WEEKLY_REPORT_ENABLED=0 tắt
+// hẳn lịch tự đăng (ép đăng tay qua POST /api/weekly-report vẫn được).
+const WEEKLY_REPORT_ENABLED = (process.env.WEEKLY_REPORT_ENABLED || 'true').toLowerCase() !== 'false';
+const WEEKLY_REPORT_DAY = (() => {
+  const d = Number(process.env.WEEKLY_REPORT_DAY);
+  return Number.isInteger(d) ? Math.min(6, Math.max(0, d)) : 1;
+})();
+const WEEKLY_REPORT_TIME = (process.env.WEEKLY_REPORT_TIME || '08:00').trim();
 // Task lifecycle (v1.9.0): khóa task hết hạn sau TASK_LOCK_TIMEOUT_MINUTES
 // phút không hoạt động (0 = khóa không bao giờ hết hạn); nhắc task quá
 // hạn / hạn hôm nay mỗi ngày 1 lần, TASK_REMINDER_ENABLED=0 tắt hẳn.
@@ -1137,6 +1165,23 @@ function parseCallbackData(data) {
 // (mặc định true): false khi lệnh đến từ Martin trên Telegram (/done,
 // /status) — Martin được quyền bỏ qua bảng chuyển trạng thái. Task xong
 // (done) hoặc quay về todo thì tự nhả khóa.
+// Mốc hoàn thành task (v1.15.0): task chuyển sang done thì đóng dấu
+// task.doneAt (ISO, giờ hoàn thành thật), mở lại thì xóa dấu. Audit
+// (v1.9.0) chỉ ghi action 'task.update' mà không ghi trạng thái mới nên
+// không suy ra được giờ xong — phải đóng dấu ngay trên task, persistMessages
+// lưu cùng tin trong messages.jsonl. Task đã done từ trước v1.15.0 không
+// có doneAt thì không tính vào "đã xong 24h qua / 7 ngày qua" (không rõ
+// giờ xong thật). Mọi chỗ đổi trạng thái task đều qua hàm này:
+// applyTaskUpdate, PATCH /api/messages/:id/task, applyIssueEventToTask.
+function stampTaskDone(next, prevStatus) {
+  if (next.status === 'done' && prevStatus !== 'done') {
+    next.doneAt = new Date().toISOString();
+  } else if (prevStatus === 'done' && next.status !== 'done') {
+    delete next.doneAt;
+  }
+  return next;
+}
+
 function applyTaskUpdate({ id, status, assignee }, opts = {}) {
   const msg = messages.find((m) => m.id === id);
   if (!msg) return { ok: false, error: `không tìm thấy tin #${id}` };
@@ -1160,6 +1205,7 @@ function applyTaskUpdate({ id, status, assignee }, opts = {}) {
     delete next.lockedBy;
     delete next.lockedAt;
   }
+  stampTaskDone(next, prevStatus);
   msg.task = next;
   persistMessages();
   appendAudit({ action: 'task.update', sender: 'martin', messageId: msg.id, source: 'telegram' });
@@ -1474,6 +1520,7 @@ function applyIssueEventToTask(event, payload) {
   if (action === 'closed' && msg.task.status !== 'done') {
     const prev = msg.task.status;
     msg.task.status = 'done';
+    stampTaskDone(msg.task, prev);
     delete msg.task.lockedBy;
     delete msg.task.lockedAt;
     msg.task.issue.state = issue.state || 'closed';
@@ -1485,6 +1532,7 @@ function applyIssueEventToTask(event, payload) {
   }
   if (action === 'reopened' && msg.task.status === 'done') {
     msg.task.status = 'todo';
+    stampTaskDone(msg.task, 'done');
     delete msg.task.lockedBy;
     delete msg.task.lockedAt;
     msg.task.issue.state = issue.state || 'open';
@@ -1687,6 +1735,14 @@ async function getBoardStatus() {
       lastFlushAt: noticeDigest.lastFlushAt,
     },
     taskAck: { enabled: TASK_ACK_ENABLED, timeoutMinutes: TASK_ACK_TIMEOUT_MINUTES },
+    // Báo cáo tuần (v1.15.0): để panel và /api/board-status hiện mà không
+    // cần gọi thêm endpoint.
+    weeklyReport: {
+      enabled: WEEKLY_REPORT_ENABLED,
+      day: WEEKLY_REPORT_DAY,
+      time: WEEKLY_REPORT_TIME,
+      lastWeek: lastWeeklyReportWeek,
+    },
   };
 }
 
@@ -2011,9 +2067,19 @@ async function handleGitHubWebhook(req, res) {
 // nào không có task mở thì không đăng (tránh spam). Ngày đã đăng được ghi
 // vào digest-state.json để restart server cũng không đăng trùng.
 let lastDigestDate = null;
+// Tuần đã đăng báo cáo tuần (v1.15.0): ngày thứ 2 đầu tuần (YYYY-MM-DD),
+// để báo cáo tuần mỗi tuần chỉ đăng 1 lần kể cả khi restart server.
+let lastWeeklyReportWeek = null;
 try {
-  lastDigestDate = JSON.parse(fs.readFileSync(DIGEST_STATE_FILE, 'utf8')).lastDigestDate || null;
+  const saved = JSON.parse(fs.readFileSync(DIGEST_STATE_FILE, 'utf8'));
+  lastDigestDate = saved.lastDigestDate || null;
+  lastWeeklyReportWeek = saved.lastWeeklyReportWeek || null;
 } catch { /* first run: no state yet */ }
+function persistDigestState() {
+  try { fs.writeFileSync(DIGEST_STATE_FILE, JSON.stringify({ lastDigestDate, lastWeeklyReportWeek }) + '\n'); } catch (e) {
+    console.error('[digest] could not save state:', e.message);
+  }
+}
 
 function localDayKey(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -2204,9 +2270,56 @@ function listIdeas(sort) {
   return list;
 }
 
+// Task đã xong trong khoảng ms qua (v1.15.0): dựa vào task.doneAt
+// (đóng dấu lúc chuyển sang done, xem stampTaskDone). Task đã done từ
+// trước v1.15.0 không có doneAt thì không tính (không rõ giờ xong thật).
+function doneTasksWithin(ms, now = Date.now()) {
+  return messages.filter((m) => m.task?.status === 'done' && m.task.doneAt
+    && now - new Date(m.task.doneAt).getTime() <= ms);
+}
+// PR đã merge trong khoảng ms qua (v1.15.0): ưu tiên meta github của tin
+// webhook (event pull_request + merged=true); dự phòng khớp text "(đã
+// merge)" cho tin cũ viết tay / tin webhook không có meta.
+function mergedPrsWithin(ms, now = Date.now()) {
+  return messages.filter((m) => {
+    if (now - new Date(m.ts || 0).getTime() > ms) return false;
+    if (m.github?.event === 'pull_request' && m.github.merged) return true;
+    return /PR #\d+.*đã merge/i.test(String(m.text || ''));
+  });
+}
+function firstLine(m, max = 80) {
+  return String(m.text || '').split('\n')[0].slice(0, max);
+}
+function doneSectionLines(done, prs, hoursLabel) {
+  const lines = [];
+  if (done.length > 0) {
+    lines.push('', `Đã xong ${hoursLabel} (${done.length}):`);
+    for (const m of done) {
+      lines.push(`  #${m.id} [${m.task.assignee || 'chưa giao'}] ${m.sender}: ${firstLine(m)}`);
+    }
+  }
+  if (prs.length > 0) {
+    lines.push('', `PR đã merge ${hoursLabel} (${prs.length}):`);
+    for (const m of prs) {
+      const g = m.github || {};
+      const label = g.number != null
+        ? `PR #${g.number}${g.repo ? ` ${g.repo}` : ''} — ${g.title || firstLine(m, 60)}`
+        : firstLine(m, 100);
+      lines.push(`  #${m.id} ${label}`);
+    }
+  }
+  return lines;
+}
+
 function buildDigestText() {
   const open = openTasks();
-  if (open.length === 0) return null;
+  // Đã xong 24h qua (v1.15.0): task xong + PR merge trong 24h qua.
+  const done24h = doneTasksWithin(24 * 3_600_000);
+  const merged24h = mergedPrsWithin(24 * 3_600_000);
+  // Không còn task mở nhưng có việc xong trong 24h thì vẫn đăng digest
+  // (trước v1.15.0: không có task mở là không đăng gì). Chỉ khi không
+  // còn gì để báo mới trả null.
+  if (open.length === 0 && done24h.length === 0 && merged24h.length === 0) return null;
   const staleMs = DIGEST_REMINDER_HOURS * 3_600_000;
   const stale = open.filter((m) => Date.now() - new Date(m.ts).getTime() > staleMs);
   const byAssignee = {};
@@ -2214,11 +2327,13 @@ function buildDigestText() {
     const key = m.task.assignee || 'chưa giao';
     (byAssignee[key] = byAssignee[key] || []).push(m);
   }
-  const lines = [`Digest ${localDayKey()} — ${open.length} task đang mở:`];
+  const lines = open.length > 0
+    ? [`Digest ${localDayKey()} — ${open.length} task đang mở:`]
+    : [`Digest ${localDayKey()} — không còn task đang mở:`];
   for (const [assignee, list] of Object.entries(byAssignee)) {
     lines.push('', `${assignee} (${list.length}):`);
     for (const m of list) {
-      lines.push(`  #${m.id} [${m.task.status}] ${m.sender}: ${String(m.text).split('\n')[0].slice(0, 80)}`);
+      lines.push(`  #${m.id} [${m.task.status}] ${m.sender}: ${firstLine(m)}`);
     }
   }
   if (stale.length > 0) {
@@ -2232,6 +2347,7 @@ function buildDigestText() {
   if (dueToday.length > 0) {
     lines.push(`Hạn hôm nay: ${dueToday.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
   }
+  lines.push(...doneSectionLines(done24h, merged24h, '24h qua'));
   return lines.join('\n');
 }
 
@@ -2248,12 +2364,10 @@ function digestDueNow(now = new Date()) {
 function triggerDigest(force = false) {
   if (!force && !digestDueNow()) return { posted: false, reason: 'not due yet' };
   const text = buildDigestText();
-  if (!text) return { posted: false, reason: 'no open tasks' };
+  if (!text) return { posted: false, reason: 'nothing to report' };
   const msg = addMessage({ sender: 'bridge', text, source: 'digest' });
   lastDigestDate = localDayKey();
-  try { fs.writeFileSync(DIGEST_STATE_FILE, JSON.stringify({ lastDigestDate }) + '\n'); } catch (e) {
-    console.error('[digest] could not save state:', e.message);
-  }
+  persistDigestState();
   console.log(`[digest] #${msg.id} posted (${openTasks().length} open tasks)`);
   forwardToTelegram(msg);
   return { posted: true, message: msg };
@@ -2265,6 +2379,121 @@ function checkDigestDue() {
     if (r.posted) console.log('[digest] morning digest posted');
   } catch (e) {
     console.error('[digest] error:', e.message);
+  }
+}
+
+// ---------- Báo cáo tuần (v1.15.0, ý 3 của Muse B ở #351) ----------
+// Mỗi tuần 1 lần vào WEEKLY_REPORT_DAY lúc WEEKLY_REPORT_TIME (giờ địa
+// phương của máy chạy bridge), tóm tắt 7 ngày qua: task đã xong, PR đã
+// merge, task/idea mới tạo, task còn mở theo người nhận, quá hạn/cần chú
+// ý. Tuần đã đăng được ghi (ngày thứ 2 đầu tuần) vào digest-state.json
+// cùng lastDigestDate nên restart server cũng không đăng trùng; server
+// tắt đúng giờ hẹn thì đăng bù ở tick tiếp theo trong cùng tuần (mốc so
+// là giờ hẹn của tuần này, không phải đúng phút đó).
+function weekMondayKey(d = new Date()) {
+  const monday = new Date(d);
+  monday.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return localDayKey(monday);
+}
+const WEEKDAY_NAMES = ['Chủ nhật', 'Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7'];
+
+function buildWeeklyReportText(now = Date.now()) {
+  const weekMs = 7 * 24 * 3_600_000;
+  const done = doneTasksWithin(weekMs, now);
+  const merged = mergedPrsWithin(weekMs, now);
+  const open = openTasks();
+  const fresh = messages.filter((m) => now - new Date(m.ts || 0).getTime() <= weekMs
+    && (m.task || isIdeaMessage(m)));
+  const overdue = open.filter((m) => deadlineBucket(m) === 'overdue');
+  // Blocked không nằm trong openTasks() (chỉ todo/doing) nên lọc riêng
+  // từ toàn bộ thread — task blocked vẫn là việc cần chú ý trong tuần.
+  const blocked = messages.filter((m) => m.task?.status === 'blocked');
+  const oldOpen = open.filter((m) => now - new Date(m.ts || 0).getTime() > weekMs);
+  const weekStart = weekMondayKey(new Date(now));
+  const lines = [`Báo cáo tuần ${weekStart} — 7 ngày qua:`];
+  // Task đã xong: #id + dòng đầu, như digest (doneAt mới tính được).
+  lines.push('', `Task đã xong (${done.length}):`);
+  if (done.length === 0) lines.push('  (không có)');
+  for (const m of done) {
+    lines.push(`  #${m.id} [${m.task.assignee || 'chưa giao'}] ${m.sender}: ${firstLine(m)}`);
+  }
+  lines.push('', `PR đã merge (${merged.length}):`);
+  if (merged.length === 0) lines.push('  (không có)');
+  for (const m of merged) {
+    const g = m.github || {};
+    const label = g.number != null
+      ? `PR #${g.number}${g.repo ? ` ${g.repo}` : ''} — ${g.title || firstLine(m, 60)}`
+      : firstLine(m, 100);
+    lines.push(`  #${m.id} ${label}`);
+  }
+  lines.push('', `Task/idea mới tạo (${fresh.length}):`);
+  if (fresh.length === 0) lines.push('  (không có)');
+  for (const m of fresh.slice(0, 20)) {
+    const kind = m.task ? `[${m.task.status}]` : '[idea]';
+    lines.push(`  #${m.id} ${kind} ${m.sender}: ${firstLine(m)}`);
+  }
+  if (fresh.length > 20) lines.push(`  … và ${fresh.length - 20} tin nữa`);
+  lines.push('', `Task còn mở (${open.length}):`);
+  if (open.length === 0) lines.push('  (không có)');
+  const byAssignee = {};
+  for (const m of open) {
+    const key = m.task.assignee || 'chưa giao';
+    (byAssignee[key] = byAssignee[key] || []).push(m);
+  }
+  for (const [assignee, list] of Object.entries(byAssignee)) {
+    lines.push(`  ${assignee} (${list.length}): ${list.map((m) => `#${m.id}`).join(', ')}`);
+  }
+  lines.push('', 'Quá hạn / cần chú ý:');
+  if (overdue.length === 0 && blocked.length === 0 && oldOpen.length === 0) lines.push('  (không có)');
+  if (overdue.length > 0) lines.push(`  Quá hạn: ${overdue.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  if (blocked.length > 0) lines.push(`  Đang blocked: ${blocked.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  if (oldOpen.length > 0) lines.push(`  Mở quá 7 ngày chưa xong: ${oldOpen.map((m) => `#${m.id} [${m.task.assignee || 'chưa giao'}]`).join(', ')}`);
+  return lines.join('\n');
+}
+
+function weeklyReportTarget(now = new Date()) {
+  const [hh, mm] = WEEKLY_REPORT_TIME.split(':').map((n) => Number(n) || 0);
+  const target = new Date(now);
+  target.setDate(now.getDate() - ((now.getDay() - WEEKLY_REPORT_DAY + 7) % 7));
+  target.setHours(hh, mm, 0, 0);
+  return target;
+}
+
+function weeklyReportDueNow(now = new Date()) {
+  if (!WEEKLY_REPORT_ENABLED) return false;
+  const target = weeklyReportTarget(now);
+  // So tuần của giờ hẹn (không phải tuần hiện tại): server tắt đúng giờ
+  // hẹn rồi bật lại vào đầu tuần sau thì vẫn đăng bù cho tuần đó, và lần
+  // đăng bù ghi đúng tuần của giờ hẹn nên không nuốt mất lần đăng định kỳ
+  // tiếp theo.
+  return now >= target && lastWeeklyReportWeek !== weekMondayKey(target);
+}
+
+// force=true: đăng ngay bất kể giờ/tuần (dùng cho POST /api/weekly-report).
+// Ép đăng tay vẫn được kể cả khi WEEKLY_REPORT_ENABLED=0 — giống POST
+// /api/digest (force bỏ qua giờ), để Martin/Muse kích hoạt thủ công.
+// Trả về {posted, reason?, message?} để route quyết định status code.
+function triggerWeeklyReport(force = false) {
+  if (!force && !weeklyReportDueNow()) return { posted: false, reason: 'not due yet' };
+  if (!force && !WEEKLY_REPORT_ENABLED) return { posted: false, reason: 'disabled' };
+  const text = buildWeeklyReportText();
+  const msg = addMessage({ sender: 'bridge', text, source: 'weekly-report' });
+  // Ghi tuần của giờ hẹn khi đăng theo lịch (đăng bù cuối tuần vẫn tính
+  // cho tuần đó); ép đăng tay thì ghi tuần hiện tại — tuần đó coi như đã
+  // có báo cáo, lần đăng định kỳ cùng tuần sẽ bỏ qua.
+  lastWeeklyReportWeek = force ? weekMondayKey() : weekMondayKey(weeklyReportTarget());
+  persistDigestState();
+  console.log(`[weekly-report] #${msg.id} posted (tuần ${lastWeeklyReportWeek})`);
+  forwardToTelegram(msg);
+  return { posted: true, message: msg };
+}
+
+function checkWeeklyReportDue() {
+  try {
+    const r = triggerWeeklyReport(false);
+    if (r.posted) console.log('[weekly-report] weekly report posted');
+  } catch (e) {
+    console.error('[weekly-report] error:', e.message);
   }
 }
 
@@ -3294,7 +3523,7 @@ ${main}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(paletteIndex.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ) · POST /api/messages/archive-read {"token"} (lưu trữ hàng loạt tin đã đọc xong) · POST /api/messages/:id/archive {"token"} (lưu trữ 1 tin) · POST /api/messages/:id/unarchive {"token"} (khôi phục tin đã lưu trữ) · GET /api/history?token=<redacted>&amp;q=&amp;sender= (tin đã lưu trữ, tìm theo từ khóa + người gửi) · GET /api/messages?archived=true (chỉ tin đã lưu trữ; archived=all = tất cả) · Board: ?view=history&amp;q=&amp;fsender= (Lịch sử + tìm kiếm) · POST /api/notice-digest {&quot;token&quot;} (đăng digest thông báo ngay) · GET /api/notice-digest?token=<redacted> (xem hàng chờ digest thông báo)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ) · POST /api/messages/archive-read {"token"} (lưu trữ hàng loạt tin đã đọc xong) · POST /api/messages/:id/archive {"token"} (lưu trữ 1 tin) · POST /api/messages/:id/unarchive {"token"} (khôi phục tin đã lưu trữ) · GET /api/history?token=<redacted>&amp;q=&amp;sender= (tin đã lưu trữ, tìm theo từ khóa + người gửi) · GET /api/messages?archived=true (chỉ tin đã lưu trữ; archived=all = tất cả) · Board: ?view=history&amp;q=&amp;fsender= (Lịch sử + tìm kiếm) · POST /api/notice-digest {&quot;token&quot;} (đăng digest thông báo ngay) · GET /api/notice-digest?token=<redacted> (xem hàng chờ digest thông báo) · GET /api/weekly-report?token=<redacted> (xem trước báo cáo tuần) · POST /api/weekly-report {&quot;token&quot;} (đăng báo cáo tuần ngay)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -3787,6 +4016,7 @@ const server = http.createServer(async (req, res) => {
       history: { active: activeMessages().length, archived: archivedMessages().length },
       noticeDigest: { enabled: NOTICE_DIGEST_ENABLED, minutes: NOTICE_DIGEST_MINUTES, queued: noticeDigest.items.length, lastFlushAt: noticeDigest.lastFlushAt },
       taskAck: { enabled: TASK_ACK_ENABLED, timeoutMinutes: TASK_ACK_TIMEOUT_MINUTES },
+      weeklyReport: { enabled: WEEKLY_REPORT_ENABLED, day: WEEKLY_REPORT_DAY, time: WEEKLY_REPORT_TIME, lastWeek: lastWeeklyReportWeek },
     });
   }
 
@@ -3817,6 +4047,7 @@ const server = http.createServer(async (req, res) => {
 <tr><td>GitHub webhook</td><td>${GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT (chưa đặt GITHUB_WEBHOOK_SECRET)'}</td></tr>
 <tr><td>GitHub Issues sync</td><td>${GITHUB_ISSUES_SYNC_ENABLED ? `BẬT — repo ${esc(GITHUB_ISSUES_REPO)}, ${issueSyncStatus().linked.length} Issue đã liên kết, ${issueSyncQueue.length} mục chờ${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — tạo/đóng/mở Issue sẽ vào hàng chờ)'}` : 'TẮT (GITHUB_ISSUES_SYNC_ENABLED=0)'}</td></tr>
 <tr><td>Digest sáng</td><td>${DIGEST_ENABLED ? `BẬT — ${esc(DIGEST_TIME)} (đã đăng gần nhất: ${esc(lastDigestDate || 'chưa')})` : 'TẮT'}</td></tr>
+<tr><td>Báo cáo tuần</td><td>${WEEKLY_REPORT_ENABLED ? `BẬT — ${esc(WEEKDAY_NAMES[WEEKLY_REPORT_DAY])} ${esc(WEEKLY_REPORT_TIME)} (tuần đã đăng gần nhất: ${esc(lastWeeklyReportWeek || 'chưa')})` : 'TẮT (ép đăng tay qua POST /api/weekly-report vẫn được)'}</td></tr>
 <tr><td>Digest thông báo</td><td>${NOTICE_DIGEST_ENABLED ? `BẬT — mỗi ${NOTICE_DIGEST_MINUTES} phút, ${noticeDigest.items.length} tin đang chờ (flush gần nhất: ${esc(noticeDigest.lastFlushAt || 'chưa')})` : 'TẮT'}</td></tr>
 <tr><td>Ack task bắt buộc</td><td>${TASK_ACK_ENABLED ? `BẬT — ${TASK_ACK_TIMEOUT_MINUTES} phút chưa ack thì nhắc, thêm ${TASK_ACK_TIMEOUT_MINUTES} phút nữa thì báo Martin` : 'TẮT'}</td></tr>
 ${wdRows}
@@ -3840,6 +4071,7 @@ ${wdRows}
       sseClients: sseClients.size,
       githubWebhook: Boolean(GITHUB_WEBHOOK_SECRET),
       digest: { enabled: DIGEST_ENABLED, time: DIGEST_TIME, lastDigestDate },
+      weeklyReport: { enabled: WEEKLY_REPORT_ENABLED, day: WEEKLY_REPORT_DAY, time: WEEKLY_REPORT_TIME, lastWeek: lastWeeklyReportWeek },
       watchdog: readWatchdogHeartbeat(),
       deploy: { enabled: AUTO_DEPLOY_ENABLED && Boolean(GITHUB_WEBHOOK_SECRET), branch: DEPLOY_BRANCH, lastDeployAt: deployState.lastDeployAt, lastDeploySha: deployState.lastDeploySha, lastDeployResult: deployState.lastDeployResult },
       presence: presenceStatus(),
@@ -4084,6 +4316,29 @@ ${wdRows}
     }
     if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
     const r = triggerDigest(true);
+    if (!r.posted) return json(res, 200, { ok: true, posted: false, reason: r.reason });
+    return json(res, 200, { ok: true, posted: true, message: r.message });
+  }
+
+  // Báo cáo tuần (v1.15.0): GET /api/weekly-report?token=... — xem trước
+  // nội dung báo cáo tuần sẽ đăng, không đăng thật; POST /api/weekly-report
+  // {"token"} — đăng báo cáo tuần ngay bất kể giờ/tuần (ép đăng tay vẫn
+  // được kể cả khi WEEKLY_REPORT_ENABLED=0).
+  if (p === '/api/weekly-report' && req.method === 'GET') {
+    if (!requireToken()) return;
+    const text = buildWeeklyReportText();
+    return json(res, 200, { ok: true, due: weeklyReportDueNow(), enabled: WEEKLY_REPORT_ENABLED, day: WEEKLY_REPORT_DAY, time: WEEKLY_REPORT_TIME, lastWeek: lastWeeklyReportWeek, text });
+  }
+  if (p === '/api/weekly-report' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = triggerWeeklyReport(true);
     if (!r.posted) return json(res, 200, { ok: true, posted: false, reason: r.reason });
     return json(res, 200, { ok: true, posted: true, message: r.message });
   }
@@ -4397,6 +4652,7 @@ ${wdRows}
       delete next.lockedBy;
       delete next.lockedAt;
     }
+    stampTaskDone(next, prevStatus);
     msg.task = next;
     persistMessages();
     appendAudit({ action: 'task.update', sender: data.sender || null, messageId: msg.id, source: 'api', ip: clientIp(req) });
@@ -4584,10 +4840,15 @@ server.listen(PORT, HOST, () => {
   console.log(`Lịch sử thread v1.12.0: BẬT — POST /api/messages/archive-read (lưu trữ hàng loạt tin đã đọc xong, cũ hơn 24h), ?view=history (GET /api/history), POST /api/messages/:id/archive|unarchive`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
   console.log(`Digest thông báo v1.14.0: ${NOTICE_DIGEST_ENABLED ? `BẬT — tin routine (presence offline + GitHub webhook) gom mỗi ${NOTICE_DIGEST_MINUTES} phút, offline vượt ${PRESENCE_OFFLINE_ESCALATE_MINUTES} phút báo ngay` : 'TẮT'}; ack task bắt buộc: ${TASK_ACK_ENABLED ? `BẬT — ${TASK_ACK_TIMEOUT_MINUTES} phút chưa ack thì nhắc, thêm ${TASK_ACK_TIMEOUT_MINUTES} phút nữa thì báo Martin` : 'TẮT'}`);
+  console.log(`Báo cáo tuần v1.15.0: ${WEEKLY_REPORT_ENABLED ? `BẬT — ${WEEKDAY_NAMES[WEEKLY_REPORT_DAY]} ${WEEKLY_REPORT_TIME} giờ địa phương (tuần đã đăng gần nhất: ${lastWeeklyReportWeek || 'chưa'})` : 'TẮT (ép đăng tay qua POST /api/weekly-report vẫn được)'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
   setInterval(checkDigestDue, 60_000);
   checkDigestDue();
+  // Báo cáo tuần (v1.15.0): kiểm tra mỗi phút cùng nhịp digest, đăng khi
+  // tới ngày/giờ hẹn trong tuần (xem checkWeeklyReportDue).
+  setInterval(checkWeeklyReportDue, 60_000);
+  checkWeeklyReportDue();
   // Digest thông báo (v1.14.0): kiểm tra mỗi phút, đăng khi đủ giờ
   // (xem checkNoticeDigestDue).
   setInterval(checkNoticeDigestDue, 60_000);
