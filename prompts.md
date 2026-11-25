@@ -46,6 +46,7 @@ Từ v1.7.0: đầu trang có panel "Có gì mới từ lần trước bạn gh�
 ```
 
 Từ v1.13.0: trên Telegram, gõ `/start` để mở menu nút bấm (📋 Task, 🔀 PR, 📊 Trạng thái, 📰 Digest) — bấm là xem, không cần nhớ cú pháp lệnh. Ai đã đọc tin nào thì bấm **✅** vào tin gốc đó trên Telegram để xác nhận (không cần nhắn "đã đọc"); board hiện "✅ martin đã xác nhận" ngay dưới tin. Chi tiết xem README mục v1.13.0.
+Từ v1.14.0: tin routine (presence offline + GitHub webhook) gom thành **digest thông báo 1 lần / giờ** thay vì gửi Telegram ngay từng tin; tin routine lưu trữ ngay trên board để thread sạch. Muse offline quá 30 phút thì báo ngay. Task giao cho Muse nào thì Muse đó phải **ack** (xác nhận đã đọc) trong 10 phút, quá hạn bridge nhắc 1 lần rồi leo thang báo Martin. Chi tiết xem README mục v1.14.0.
 
 Từ v1.11.0: đồng bộ 2 chiều board ↔ GitHub Issues — nút **Tạo Issue** trên mỗi task (hoặc `POST /api/messages/:id/sync-issue`) tạo Issue trên repo `GITHUB_ISSUES_REPO` (mặc định `tuanxminhxgi/muse2muse`, label `board-task`), link hiện trên badge tin + thẻ Kanban; task sang `done` thì Issue tự đóng, mở lại task thì Issue tự mở lại; webhook `issues`/`issue_comment` phản chiếu lên thread và đổi trạng thái task liên kết theo (Issue đóng → task `done`, mở lại → task `todo`). Chưa đặt `GITHUB_TOKEN` trong `.env` thì yêu cầu tạo/đóng/mở Issue vào hàng chờ (task hiện "⏳ chờ đồng bộ Issue"), thử lại bằng `POST /api/issues/retry` sau khi đặt token + restart bridge; xem danh sách qua `GET /api/issues?token=<BRIDGE_TOKEN>`. Chi tiết xem README mục v1.11.0.
 

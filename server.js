@@ -27,6 +27,7 @@
 //   3) Nhắc việc + digest định kỳ: mỗi sáng DIGEST_TIME tự đăng digest
 //      các task đang mở (todo/doing) + nhắc task quá hạn chưa cập nhật;
 //      POST /api/digest để kích hoạt ngay, GET /api/digest để xem trước.
+//      POST /api/notice-digest để đăng digest thông báo ngay (v1.14.0).
 //
 // v1.4.0 (Muse C's 3 ideas, tin #38/#42/#43 — rebase lên main 28cfa9c sau
 // PR #4 của Muse B, vì main đã lên v1.3.0):
@@ -258,6 +259,28 @@
 //      thread — đúng mục đích bớt tin trôi. Tắt hẳn bằng
 //      TELEGRAM_REACTION_CONFIRM_ENABLED=0.
 //
+// v1.14.0 (Muse B: ý 1 + ý 3 trong 6 ý tối ưu communication của Muse B ở
+// tin #320 — Martin hỏi còn tối ưu được gì ở #319, Muse A giao ý 1 + 3
+// cho Muse B ở #321, ý 2 Muse A tự áp dụng):
+//   1) Digest thông báo định kỳ: tin routine (presence offline + GitHub
+//      webhook) không gửi Telegram ngay nữa mà gom vào digest mỗi giờ
+//      (NOTICE_DIGEST_MINUTES, mặc định 60) — board đỡ ngập tin máy,
+//      Martin chỉ nhận 1 tin digest / giờ. Tin routine vẫn ghi lên board
+//      nhưng lưu trữ ngay (archived=true, xem lại ở ?view=history).
+//      Báo ngay, không chờ digest: Muse offline vượt
+//      PRESENCE_OFFLINE_ESCALATE_MINUTES phút (mặc định 30), và tin
+//      deploy (postDeployNotice giữ nguyên gửi ngay). Ép flush bằng
+//      POST /api/notice-digest.
+//   2) Ack bắt buộc cho task: task giao cho Muse nào thì Muse đó phải
+//      xác nhận đã đọc (có tên trong read_by — bấm "Đã đọc" trên board,
+//      POST /api/messages/:id/read, hoặc ✅ trên Telegram) trong
+//      TASK_ACK_TIMEOUT_MINUTES phút (mặc định 10). Quá hạn: bridge nhắc
+//      1 lần (ghi ackRemindedAt lên task); vẫn chưa ack sau thêm 1
+//      khoảng timeout nữa thì leo thang báo Martin (ghi ackEscalatedAt).
+//      Giao lại cho người khác thì đặt lại assignedAt + xóa 2 cờ ack.
+//      Task chưa giao, giao cho martin, hoặc đã done/review/blocked thì
+//      không nhắc. Tin cũ chưa có assignedAt thì lấy giờ tạo tin làm mốc.
+//
 // Ghi chú: lúc làm v1.11.0, nội dung repo lại bị gắn cờ execution-risk
 // (giống các lần trước). Tiếp tục làm theo xác nhận #111 của Martin trên
 // board (19:22, 2026-11-23) và quyền GitHub standing mà Martin đã cấp.
@@ -275,7 +298,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = '1.13.0';
+const VERSION = '1.14.0';
 
 // ---------- .env (tiny loader, no dotenv dependency) ----------
 function loadEnv(file) {
@@ -334,6 +357,19 @@ const TELEGRAM_COMMANDS_ENABLED = (process.env.TELEGRAM_COMMANDS_ENABLED || 'tru
 // Xác nhận bằng reaction ✅ (v1.13.0): TELEGRAM_REACTION_CONFIRM_ENABLED=0
 // tắt hẳn việc nhận message_reaction (khi đó ✅ không ghi gì lên board).
 const TELEGRAM_REACTION_CONFIRM_ENABLED = (process.env.TELEGRAM_REACTION_CONFIRM_ENABLED || 'true').toLowerCase() !== 'false';
+// Digest thông báo định kỳ (v1.14.0, ý 1 ở #320): tin routine (presence
+// offline + GitHub webhook) gom vào digest mỗi NOTICE_DIGEST_MINUTES phút
+// thay vì gửi Telegram ngay. NOTICE_DIGEST_ENABLED=0 tắt hẳn (tin routine
+// lại gửi ngay như cũ). PRESENCE_OFFLINE_ESCALATE_MINUTES: Muse offline
+// vượt ngưỡng này thì báo ngay, không chờ digest.
+const NOTICE_DIGEST_ENABLED = (process.env.NOTICE_DIGEST_ENABLED || 'true').toLowerCase() !== 'false';
+const NOTICE_DIGEST_MINUTES = Number(process.env.NOTICE_DIGEST_MINUTES || 60);
+const PRESENCE_OFFLINE_ESCALATE_MINUTES = Number(process.env.PRESENCE_OFFLINE_ESCALATE_MINUTES || 30);
+// Ack bắt buộc cho task (v1.14.0, ý 3 ở #320): Muse được giao task phải
+// xác nhận đã đọc trong TASK_ACK_TIMEOUT_MINUTES phút, quá hạn thì nhắc
+// rồi leo thang báo Martin. TASK_ACK_ENABLED=0 tắt hẳn.
+const TASK_ACK_ENABLED = (process.env.TASK_ACK_ENABLED || 'true').toLowerCase() !== 'false';
+const TASK_ACK_TIMEOUT_MINUTES = Number(process.env.TASK_ACK_TIMEOUT_MINUTES || 10);
 // Task lifecycle (v1.9.0): khóa task hết hạn sau TASK_LOCK_TIMEOUT_MINUTES
 // phút không hoạt động (0 = khóa không bao giờ hết hạn); nhắc task quá
 // hạn / hạn hôm nay mỗi ngày 1 lần, TASK_REMINDER_ENABLED=0 tắt hẳn.
@@ -505,22 +541,42 @@ function presenceStatus() {
   });
 }
 // Mỗi phút: Muse nào quá PRESENCE_OFFLINE_MINUTES phút không check-in thì
-// báo Martin qua Telegram đúng 1 lần / lần offline (cờ notifiedOffline;
-// khi Muse quay lại thì recordHeartbeat xóa cờ).
+// báo Martin đúng 1 lần / lần offline (cờ notifiedOffline; khi Muse quay
+// lại thì recordHeartbeat xóa cờ). Từ v1.14.0: tin offline không gửi
+// Telegram ngay mà gom vào digest theo giờ (queueRoutineNotice) — trừ khi
+// Muse đã offline vượt PRESENCE_OFFLINE_ESCALATE_MINUTES phút thì báo ngay
+// (leo thang, cờ escalatedOffline, 1 lần / lần offline).
 async function checkPresenceOffline() {
   if (!telegramEnabled || !PRESENCE_OFFLINE_MS) return;
   const now = Date.now();
   for (const muse of MUSES) {
     const p = presence[muse];
-    if (!p?.lastSeen || p.notifiedOffline) continue;
+    if (!p?.lastSeen) continue;
+    const agoMin = Math.floor((now - new Date(p.lastSeen).getTime()) / 60_000);
+    if (p.notifiedOffline) {
+      if (p.escalatedOffline || agoMin < PRESENCE_OFFLINE_ESCALATE_MINUTES) continue;
+      presence[muse] = { ...p, escalatedOffline: true };
+      persistPresence();
+      const text = `[bridge] ${muse} vẫn offline ${agoMin} phút (không check-in từ ${p.lastSeen}) — vượt ${PRESENCE_OFFLINE_ESCALATE_MINUTES} phút, báo ngay thay vì chờ digest.`;
+      const msg = addMessage({ sender: 'bridge', text, source: 'presence' });
+      console.log(`[presence] offline escalate #${msg.id} ${muse} (${agoMin}m)`);
+      await forwardToTelegram(msg);
+      appendAudit({ action: 'presence.offline-escalate', sender: 'bridge', messageId: msg.id, source: 'presence' });
+      continue;
+    }
     if (now - new Date(p.lastSeen).getTime() <= PRESENCE_OFFLINE_MS) continue;
     presence[muse] = { ...p, notifiedOffline: true };
     persistPresence();
-    const agoMin = Math.floor((now - new Date(p.lastSeen).getTime()) / 60_000);
     const text = `[bridge] ${muse} đã offline ${agoMin} phút (không check-in từ ${p.lastSeen}).`;
     const msg = addMessage({ sender: 'bridge', text, source: 'presence' });
     console.log(`[presence] offline notice #${msg.id} ${muse} (${agoMin}m)`);
-    await forwardToTelegram(msg);
+    if (agoMin >= PRESENCE_OFFLINE_ESCALATE_MINUTES) {
+      // Bridge vừa khởi động lại / check trễ: đã quá ngưỡng leo thang thì
+      // báo ngay, không gom vào digest nữa.
+      await forwardToTelegram(msg);
+    } else {
+      await queueRoutineNotice(msg, 'presence');
+    }
     appendAudit({ action: 'presence.offline', sender: 'bridge', messageId: msg.id, source: 'presence' });
   }
 }
@@ -719,7 +775,12 @@ function addMessage({ sender, text, source, task, type, reply_to, github }) {
   // buildGitHubMeta — tin cũ không có trường này vẫn đọc bình thường.
   if (github && typeof github === 'object') msg.github = github;
   const t = normalizeTask(task);
-  if (t) msg.task = t;
+  if (t) {
+    msg.task = t;
+    // Ack bắt buộc (v1.14.0): mốc giao task = giờ tạo tin; applyTaskUpdate
+    // đặt lại mốc này khi đổi assignee.
+    if (t.assignee) t.assignedAt = msg.ts;
+  }
   const meta = normalizeMeta({ type, reply_to }, Boolean(t));
   msg.type = meta.type;
   if (meta.replyTo !== null) msg.reply_to = meta.replyTo;
@@ -1088,6 +1149,13 @@ function applyTaskUpdate({ id, status, assignee }, opts = {}) {
   const next = { ...msg.task };
   if (status !== undefined) next.status = status;
   if (assignee !== undefined) next.assignee = assignee;
+  // Ack bắt buộc (v1.14.0): đổi người nhận thì đặt lại mốc giao + xóa 2
+  // cờ ack để người mới có đủ thời gian xác nhận đã đọc.
+  if (assignee !== undefined && assignee !== msg.task.assignee) {
+    next.assignedAt = new Date().toISOString();
+    delete next.ackRemindedAt;
+    delete next.ackEscalatedAt;
+  }
   if (next.status === 'done' || next.status === 'todo') {
     delete next.lockedBy;
     delete next.lockedAt;
@@ -1610,6 +1678,15 @@ async function getBoardStatus() {
     autoReview: { enabled: AUTO_REVIEW_ENABLED },
     presence: presenceStatus(),
     issues: issueSyncStatus(),
+    // Digest thông báo + ack bắt buộc (v1.14.0): để panel và /api/board-status
+    // hiện mà không cần gọi thêm endpoint.
+    noticeDigest: {
+      enabled: NOTICE_DIGEST_ENABLED,
+      minutes: NOTICE_DIGEST_MINUTES,
+      queued: noticeDigest.items.length,
+      lastFlushAt: noticeDigest.lastFlushAt,
+    },
+    taskAck: { enabled: TASK_ACK_ENABLED, timeoutMinutes: TASK_ACK_TIMEOUT_MINUTES },
   };
 }
 
@@ -1902,7 +1979,9 @@ async function handleGitHubWebhook(req, res) {
   if (linkedMessageId !== null && meta) meta.linkedMessageId = linkedMessageId;
   const msg = addMessage({ sender: 'github', text, source: 'github-webhook', github: meta });
   console.log(`[github] #${msg.id} ${event} ${repo}`);
-  forwardToTelegram(msg);
+  // v1.14.0: tin GitHub là tin routine — gom vào digest theo giờ thay vì
+  // gửi Telegram ngay (xem queueRoutineNotice).
+  queueRoutineNotice(msg, 'github');
   // Review chéo PR tự động (v1.10.0): PR mở/cập nhật thì Muse khác tác
   // giả đăng review kiểm tra tự động lên thread. Chạy nền, không chặn
   // trả webhook; lỗi thì chỉ log vì tin PR đã đăng xong.
@@ -2186,6 +2265,149 @@ function checkDigestDue() {
     if (r.posted) console.log('[digest] morning digest posted');
   } catch (e) {
     console.error('[digest] error:', e.message);
+  }
+}
+
+// ---------- Digest thông báo định kỳ (v1.14.0, ý 1 của Muse B ở #320) ----------
+// Tin routine (presence offline + GitHub webhook) không gửi Telegram ngay
+// mà gom vào digest mỗi NOTICE_DIGEST_MINUTES phút — board đỡ ngập tin
+// máy, Martin chỉ nhận 1 tin digest / giờ. Tin routine vẫn ghi lên board
+// nhưng lưu trữ ngay (archived=true, xem lại ở ?view=history, khôi phục
+// được như tin v1.12.0). Ngoại lệ báo ngay: Muse offline vượt
+// PRESENCE_OFFLINE_ESCALATE_MINUTES (xem checkPresenceOffline) và tin
+// deploy (postDeployNotice giữ nguyên gửi ngay). Hàng chờ lưu ở
+// notice-digest.json để restart server không mất tin đã gom.
+const NOTICE_DIGEST_FILE = path.join(__dirname, 'notice-digest.json');
+let noticeDigest = { lastFlushAt: null, items: [] };
+try {
+  const saved = JSON.parse(fs.readFileSync(NOTICE_DIGEST_FILE, 'utf8'));
+  if (Array.isArray(saved.items)) noticeDigest = { lastFlushAt: saved.lastFlushAt || null, items: saved.items };
+} catch { /* first run: no file yet */ }
+function persistNoticeDigest() {
+  try { fs.writeFileSync(NOTICE_DIGEST_FILE, JSON.stringify(noticeDigest) + '\n'); } catch (e) {
+    console.error('[notice-digest] could not save state:', e.message);
+  }
+}
+// Gom 1 tin routine vào hàng chờ digest (đồng thời lưu trữ tin trên board
+// để thread đang hoạt động sạch). Tắt digest thì gửi ngay như cũ.
+async function queueRoutineNotice(msg, kind) {
+  if (!NOTICE_DIGEST_ENABLED) { await forwardToTelegram(msg); return; }
+  msg.archived = true;
+  msg.archivedAt = new Date().toISOString();
+  persistMessages();
+  broadcastMessage(msg);
+  noticeDigest.items.push({ messageId: msg.id, ts: msg.ts, kind });
+  persistNoticeDigest();
+  console.log(`[notice-digest] queued #${msg.id} (${kind}, ${noticeDigest.items.length} chờ)`);
+}
+function buildNoticeDigestText() {
+  if (noticeDigest.items.length === 0) return null;
+  const byKind = { github: [], presence: [] };
+  for (const item of noticeDigest.items) {
+    const m = messages.find((x) => x.id === item.messageId);
+    if (!m) continue;
+    (byKind[item.kind] || (byKind[item.kind] = [])).push(m);
+  }
+  const total = byKind.github.length + byKind.presence.length;
+  if (total === 0) return null;
+  const since = new Date(noticeDigest.items[0].ts).toTimeString().slice(0, 5);
+  const lines = [`📰 Digest thông báo — ${total} tin routine gom từ ${since}:`];
+  if (byKind.github.length > 0) {
+    lines.push('', `GitHub (${byKind.github.length}):`);
+    for (const m of byKind.github) lines.push(`  #${m.id} ${String(m.text).split('\n')[0].slice(0, 100)}`);
+  }
+  if (byKind.presence.length > 0) {
+    lines.push('', `Offline (${byKind.presence.length}):`);
+    for (const m of byKind.presence) lines.push(`  #${m.id} ${String(m.text).split('\n')[0].slice(0, 100)}`);
+  }
+  lines.push('', 'Chi tiết từng tin xem ở Lịch sử (?view=history).');
+  return lines.join('\n');
+}
+// force=true: đăng ngay bất kể giờ (dùng cho POST /api/notice-digest).
+// Mốc giờ tính từ lần flush trước, hoặc từ tin gom đầu tiên nếu chưa
+// flush lần nào (tránh flush ngay khi vừa gom tin đầu tiên).
+function triggerNoticeDigest(force = false) {
+  if (!NOTICE_DIGEST_ENABLED) return { posted: false, reason: 'disabled' };
+  if (noticeDigest.items.length === 0) return { posted: false, reason: 'no queued notices' };
+  if (!force) {
+    const baseline = noticeDigest.lastFlushAt
+      ? new Date(noticeDigest.lastFlushAt).getTime()
+      : new Date(noticeDigest.items[0].ts).getTime();
+    if (Date.now() - baseline < NOTICE_DIGEST_MINUTES * 60_000) return { posted: false, reason: 'not due yet' };
+  }
+  const text = buildNoticeDigestText();
+  if (!text) { noticeDigest.items = []; persistNoticeDigest(); return { posted: false, reason: 'no queued notices' }; }
+  const count = noticeDigest.items.length;
+  const msg = addMessage({ sender: 'bridge', text, source: 'notice-digest' });
+  noticeDigest.items = [];
+  noticeDigest.lastFlushAt = new Date().toISOString();
+  persistNoticeDigest();
+  console.log(`[notice-digest] #${msg.id} posted (${count} notices)`);
+  forwardToTelegram(msg);
+  appendAudit({ action: 'notice-digest.post', sender: 'bridge', messageId: msg.id, source: 'notice-digest' });
+  return { posted: true, message: msg };
+}
+function checkNoticeDigestDue() {
+  try {
+    const r = triggerNoticeDigest(false);
+    if (r.posted) console.log('[notice-digest] hourly digest posted');
+  } catch (e) {
+    console.error('[notice-digest] error:', e.message);
+  }
+}
+
+// ---------- Ack bắt buộc cho task (v1.14.0, ý 3 của Muse B ở #320) ----------
+// Task giao cho Muse nào thì Muse đó phải xác nhận đã đọc (có tên trong
+// read_by — bấm "Đã đọc" trên board, gọi POST /api/messages/:id/read,
+// hoặc ✅ trên Telegram từ v1.13.0) trong TASK_ACK_TIMEOUT_MINUTES phút
+// (mặc định 10). Quá hạn: bridge nhắc 1 lần, ghi ackRemindedAt lên task;
+// vẫn chưa ack sau thêm 1 khoảng timeout nữa thì leo thang báo Martin,
+// ghi ackEscalatedAt. Giao lại cho người khác (applyTaskUpdate đổi
+// assignee) thì đặt lại assignedAt + xóa 2 cờ ack. Task chưa giao, giao
+// cho martin, hoặc đã done/review/blocked thì không nhắc. Tin cũ chưa có
+// assignedAt thì lấy giờ tạo tin làm mốc. Mỗi lần sweep gom tối đa 1 tin
+// nhắc + 1 tin leo thang (như sweepTaskReminders).
+function taskAckState(m, now = Date.now()) {
+  const t = m.task;
+  if (!t || !t.assignee || !MUSES.includes(t.assignee)) return null;
+  if (t.status !== 'todo' && t.status !== 'doing') return null;
+  if ((m.read_by || []).includes(t.assignee)) return null;
+  const assignedAt = t.assignedAt ? new Date(t.assignedAt).getTime() : new Date(m.ts).getTime();
+  const ageMin = (now - assignedAt) / 60_000;
+  if (ageMin < TASK_ACK_TIMEOUT_MINUTES) return null;
+  if (!t.ackRemindedAt) return 'remind';
+  const remindedAt = new Date(t.ackRemindedAt).getTime();
+  if (!t.ackEscalatedAt && (now - remindedAt) / 60_000 >= TASK_ACK_TIMEOUT_MINUTES) return 'escalate';
+  return null;
+}
+function sweepTaskAck() {
+  if (!TASK_ACK_ENABLED) return;
+  const now = Date.now();
+  const remind = [];
+  const escalate = [];
+  for (const m of messages) {
+    const state = taskAckState(m, now);
+    if (state === 'remind') remind.push(m);
+    else if (state === 'escalate') escalate.push(m);
+  }
+  if (remind.length === 0 && escalate.length === 0) return;
+  if (remind.length > 0) {
+    const lines = remind.map((m) => `#${m.id} @${m.task.assignee} — ${String(m.text).split('\n')[0].slice(0, 80)}`);
+    const msg = addMessage({ sender: 'bridge', text: `[bridge] Nhắc ack: các task sau đã giao quá ${TASK_ACK_TIMEOUT_MINUTES} phút mà Muse được giao chưa xác nhận đã đọc — bấm "Đã đọc" trên board hoặc ✅ trên Telegram:\n${lines.join('\n')}`, source: 'task-ack' });
+    for (const m of remind) m.task.ackRemindedAt = new Date().toISOString();
+    persistMessages();
+    console.log(`[ack] reminder #${msg.id} (${remind.length} task)`);
+    forwardToTelegram(msg);
+    for (const m of remind) appendAudit({ action: 'task.ack.reminder', sender: 'bridge', messageId: m.id, source: 'task-ack' });
+  }
+  if (escalate.length > 0) {
+    const lines = escalate.map((m) => `#${m.id} @${m.task.assignee} — ${String(m.text).split('\n')[0].slice(0, 80)}`);
+    const msg = addMessage({ sender: 'bridge', text: `[bridge] Task chưa ack — @martin xem giúp: các task sau đã giao quá ${TASK_ACK_TIMEOUT_MINUTES * 2} phút chưa xác nhận đã đọc (đã nhắc 1 lần):\n${lines.join('\n')}`, source: 'task-ack' });
+    for (const m of escalate) m.task.ackEscalatedAt = new Date().toISOString();
+    persistMessages();
+    console.log(`[ack] escalate #${msg.id} (${escalate.length} task)`);
+    forwardToTelegram(msg);
+    for (const m of escalate) appendAudit({ action: 'task.ack.escalate', sender: 'bridge', messageId: m.id, source: 'task-ack' });
   }
 }
 
@@ -3072,7 +3294,7 @@ ${main}
 <p style="color:#888;font-size:12px">Phím tắt: <b>Ctrl+K</b> mở command palette (nhảy tới tin/task hoặc gửi tin nhanh) · <b>/</b> focus ô soạn tin · <b>Esc</b> đóng palette. Mỗi tin có nút Trả lời / Đã đọc / đổi trạng thái task / Giao cho / Copy link ngay dưới tin.</p>
 <div id="palette"><input id="palette-input" type="text" placeholder="Gõ để tìm tin, task… hoặc gõ tin rồi Enter để gửi nhanh" style="width:100%;box-sizing:border-box;padding:8px;font-size:14px"><div id="palette-list" style="margin-top:6px;max-height:300px;overflow:auto"></div></div>
 <script>var MSG_INDEX = ${JSON.stringify(paletteIndex.slice(-100).map((m) => ({ id: m.id, sender: m.sender, text: String(m.text).split('\n')[0].slice(0, 80), task: m.task ? m.task.status : null }))).replace(/</g, '\\u003c')};</script>
-<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ) · POST /api/messages/archive-read {"token"} (lưu trữ hàng loạt tin đã đọc xong) · POST /api/messages/:id/archive {"token"} (lưu trữ 1 tin) · POST /api/messages/:id/unarchive {"token"} (khôi phục tin đã lưu trữ) · GET /api/history?token=<redacted>&amp;q=&amp;sender= (tin đã lưu trữ, tìm theo từ khóa + người gửi) · GET /api/messages?archived=true (chỉ tin đã lưu trữ; archived=all = tất cả) · Board: ?view=history&amp;q=&amp;fsender= (Lịch sử + tìm kiếm)</p>
+<p style="color:#888;font-size:12px">API: GET /api/messages?since=&lt;id&gt;&amp;token=... · POST /api/msg {"sender","text","token"} · GET /api/tasks?token=... · GET /api/events?token=... (SSE live) · GET /status · GET /api/digest?token=... · POST /api/github-webhook · GET /api/presence?token=... · POST /api/heartbeat · POST /api/messages/:id/read {"token","reader"} · GET /api/since?token=...&amp;sender=&amp;since= (tóm tắt lăn + tin mới) · POST /api/typing {"token","sender","typing"} · GET /api/board-status?token=... (trạng thái hệ thống cho panel) · POST /api/messages/:id/pin {"token","pinned"} · POST /api/messages/:id/claim|release {"token","sender"} · GET /api/tasks?locked=held|stale|free · GET /api/pinned?token=... (tin đã ghim) · GET /api/decisions?token=...&amp;q=&amp;sender= (quyết định, tìm theo từ khóa + người gửi) · Board: ?view=kanban&amp;fassignee=&amp;fstatus=&amp;fdeadline= (Kanban + lọc task) · ?view=saved&amp;q=&amp;fsender=&amp;fkind= (Đã ghim &amp; Quyết định + tìm kiếm) · ?view=queue (Hàng đợi ưu tiên + ideas được bình chọn) · POST /api/messages/:id/vote {"token","voter"} (bình chọn / rút vote) · GET /api/queue?token=... · GET /api/ideas?token=...&amp;sort=votes|new · GET /api/reviews?token=... (review PR tự động gần nhất) · POST /api/messages/:id/sync-issue {"token"} (tạo Issue GitHub cho task) · GET /api/issues?token=<redacted> (Issue đã liên kết + hàng chờ) · POST /api/issues/retry {"token"} (thử lại hàng chờ) · POST /api/messages/archive-read {"token"} (lưu trữ hàng loạt tin đã đọc xong) · POST /api/messages/:id/archive {"token"} (lưu trữ 1 tin) · POST /api/messages/:id/unarchive {"token"} (khôi phục tin đã lưu trữ) · GET /api/history?token=<redacted>&amp;q=&amp;sender= (tin đã lưu trữ, tìm theo từ khóa + người gửi) · GET /api/messages?archived=true (chỉ tin đã lưu trữ; archived=all = tất cả) · Board: ?view=history&amp;q=&amp;fsender= (Lịch sử + tìm kiếm) · POST /api/notice-digest {&quot;token&quot;} (đăng digest thông báo ngay) · GET /api/notice-digest?token=<redacted> (xem hàng chờ digest thông báo)</p>
 <script>
 // Live update qua SSE; trang vẫn render đầy đủ từ server nên không có JS
 // thì vẫn đọc/gửi được. Nếu EventSource lỗi thì không làm gì thêm.
@@ -3563,6 +3785,8 @@ const server = http.createServer(async (req, res) => {
       },
       issues: issueSyncStatus(),
       history: { active: activeMessages().length, archived: archivedMessages().length },
+      noticeDigest: { enabled: NOTICE_DIGEST_ENABLED, minutes: NOTICE_DIGEST_MINUTES, queued: noticeDigest.items.length, lastFlushAt: noticeDigest.lastFlushAt },
+      taskAck: { enabled: TASK_ACK_ENABLED, timeoutMinutes: TASK_ACK_TIMEOUT_MINUTES },
     });
   }
 
@@ -3593,6 +3817,8 @@ const server = http.createServer(async (req, res) => {
 <tr><td>GitHub webhook</td><td>${GITHUB_WEBHOOK_SECRET ? 'BẬT' : 'TẮT (chưa đặt GITHUB_WEBHOOK_SECRET)'}</td></tr>
 <tr><td>GitHub Issues sync</td><td>${GITHUB_ISSUES_SYNC_ENABLED ? `BẬT — repo ${esc(GITHUB_ISSUES_REPO)}, ${issueSyncStatus().linked.length} Issue đã liên kết, ${issueSyncQueue.length} mục chờ${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — tạo/đóng/mở Issue sẽ vào hàng chờ)'}` : 'TẮT (GITHUB_ISSUES_SYNC_ENABLED=0)'}</td></tr>
 <tr><td>Digest sáng</td><td>${DIGEST_ENABLED ? `BẬT — ${esc(DIGEST_TIME)} (đã đăng gần nhất: ${esc(lastDigestDate || 'chưa')})` : 'TẮT'}</td></tr>
+<tr><td>Digest thông báo</td><td>${NOTICE_DIGEST_ENABLED ? `BẬT — mỗi ${NOTICE_DIGEST_MINUTES} phút, ${noticeDigest.items.length} tin đang chờ (flush gần nhất: ${esc(noticeDigest.lastFlushAt || 'chưa')})` : 'TẮT'}</td></tr>
+<tr><td>Ack task bắt buộc</td><td>${TASK_ACK_ENABLED ? `BẬT — ${TASK_ACK_TIMEOUT_MINUTES} phút chưa ack thì nhắc, thêm ${TASK_ACK_TIMEOUT_MINUTES} phút nữa thì báo Martin` : 'TẮT'}</td></tr>
 ${wdRows}
 </table>
 <p style="color:#888;font-size:12px">JSON: <a href="/api/status">/api/status</a> · Health: <a href="/health">/health</a></p>
@@ -3858,6 +4084,27 @@ ${wdRows}
     }
     if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
     const r = triggerDigest(true);
+    if (!r.posted) return json(res, 200, { ok: true, posted: false, reason: r.reason });
+    return json(res, 200, { ok: true, posted: true, message: r.message });
+  }
+
+  // Digest thông báo: GET /api/notice-digest?token=... — xem hàng chờ
+  // (số tin đã gom, lần flush gần nhất); POST /api/notice-digest
+  // {"token"} — đăng digest ngay bất kể giờ (v1.14.0).
+  if (p === '/api/notice-digest' && req.method === 'GET') {
+    if (!requireToken()) return;
+    return json(res, 200, { ok: true, enabled: NOTICE_DIGEST_ENABLED, minutes: NOTICE_DIGEST_MINUTES, queued: noticeDigest.items.length, lastFlushAt: noticeDigest.lastFlushAt, items: noticeDigest.items });
+  }
+  if (p === '/api/notice-digest' && req.method === 'POST') {
+    if (rateLimited(req)) return json(res, 429, { ok: false, error: 'rate limited' });
+    let data = {};
+    try { data = JSON.parse(await readBody(req)); } catch {}
+    if (data.token !== BRIDGE_TOKEN) {
+      if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+      return json(res, 401, { ok: false, error: 'bad token' });
+    }
+    if (tokenExpired()) return json(res, 410, { ok: false, error: TOKEN_EXPIRED_MSG });
+    const r = triggerNoticeDigest(true);
     if (!r.posted) return json(res, 200, { ok: true, posted: false, reason: r.reason });
     return json(res, 200, { ok: true, posted: true, message: r.message });
   }
@@ -4336,18 +4583,26 @@ server.listen(PORT, HOST, () => {
   console.log(`Đồng bộ Issues 2 chiều v1.11.0: ${GITHUB_ISSUES_SYNC_ENABLED ? `BẬT — repo ${GITHUB_ISSUES_REPO}, label ${GITHUB_ISSUES_LABEL}${GITHUB_TOKEN ? '' : ' (chưa đặt GITHUB_TOKEN — tạo/đóng/mở Issue sẽ vào hàng chờ đồng bộ)'}` : 'TẮT (GITHUB_ISSUES_SYNC_ENABLED=0)'}`);
   console.log(`Lịch sử thread v1.12.0: BẬT — POST /api/messages/archive-read (lưu trữ hàng loạt tin đã đọc xong, cũ hơn 24h), ?view=history (GET /api/history), POST /api/messages/:id/archive|unarchive`);
   console.log(`Digest sáng: ${DIGEST_ENABLED ? `BẬT — ${DIGEST_TIME} giờ địa phương` : 'TẮT'}`);
+  console.log(`Digest thông báo v1.14.0: ${NOTICE_DIGEST_ENABLED ? `BẬT — tin routine (presence offline + GitHub webhook) gom mỗi ${NOTICE_DIGEST_MINUTES} phút, offline vượt ${PRESENCE_OFFLINE_ESCALATE_MINUTES} phút báo ngay` : 'TẮT'}; ack task bắt buộc: ${TASK_ACK_ENABLED ? `BẬT — ${TASK_ACK_TIMEOUT_MINUTES} phút chưa ack thì nhắc, thêm ${TASK_ACK_TIMEOUT_MINUTES} phút nữa thì báo Martin` : 'TẮT'}`);
   if (telegramEnabled) pollTelegram();
   // Digest định kỳ: kiểm tra mỗi phút, đăng khi tới giờ (xem checkDigestDue).
   setInterval(checkDigestDue, 60_000);
   checkDigestDue();
+  // Digest thông báo (v1.14.0): kiểm tra mỗi phút, đăng khi đủ giờ
+  // (xem checkNoticeDigestDue).
+  setInterval(checkNoticeDigestDue, 60_000);
+  checkNoticeDigestDue();
   // Presence offline: kiểm tra mỗi phút (xem checkPresenceOffline).
   setInterval(checkPresenceOffline, 60_000);
   // Task lifecycle (v1.9.0): quét khóa hết hạn + nhắc task quá hạn / hạn
   // hôm nay mỗi phút; chạy 1 lần ngay khi khởi động để dọn khóa cũ.
+  // Ack bắt buộc (v1.14.0): quét cùng nhịp, chạy 1 lần khi khởi động.
   setInterval(() => {
     try { sweepTaskLocks(); } catch (e) { console.error('[lifecycle] sweep locks error:', e.message); }
     try { sweepTaskReminders(); } catch (e) { console.error('[lifecycle] sweep reminders error:', e.message); }
+    try { sweepTaskAck(); } catch (e) { console.error('[ack] sweep error:', e.message); }
   }, 60_000);
   sweepTaskLocks();
   sweepTaskReminders();
+  sweepTaskAck();
 });
