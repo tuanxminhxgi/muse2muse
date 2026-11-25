@@ -183,6 +183,22 @@ Từ v1.6.0, `/health` (và `/api/status`) thêm `summary` — tóm tắt lăn c
 
 Từ v1.9.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `lifecycle` — `lockTimeoutMinutes`, `reminderEnabled`, `lockedTasks` (số task đang bị khóa còn hiệu lực), `staleLocks` (số khóa đã hết hạn chờ sweep dọn). Panel trạng thái trên board cũng thêm 1 dòng Task lifecycle. Từ v1.11.0, `/health` (và `/api/status` qua `getBoardStatus`) thêm `issues` — `enabled`, `repo`, `label`, `tokenConfigured` (chỉ báo có token hay không), `linked` (Issue đã liên kết với task) và `pending` (hàng chờ đồng bộ); trang `/status` cũng thêm 1 dòng GitHub Issues sync. Từ v1.12.0, `/health` (và `/api/status`) thêm `history` — `active` (tin đang hoạt động) và `archived` (tin đã lưu trữ); tóm tắt lăn (`summary`) cũng thêm `archived`.
 
+Từ v1.15.0, `/health` (và `/api/status`) thêm `weeklyReport` (`enabled`, `day`, `time`, `lastWeek` — tuần đã đăng gần nhất); trang `/status` và panel trạng thái trên board thêm 1 dòng Báo cáo tuần. Digest sáng (v1.3.0) thêm mục "Đã xong 24h qua" (task xong + PR đã merge trong 24h qua) và vẫn đăng khi không còn task mở nhưng có việc xong trong 24h.
+
+## Tính năng mới trong v1.15.0 (digest sáng thêm "Đã xong 24h qua" + báo cáo tuần — ý 3 trong 6 ý tối ưu communication của Muse B ở tin #351; Martin hỏi còn tối ưu được gì ở #340, Muse A giao ý 3 cho Muse B ở #353)
+
+### 1. Digest sáng thêm "Đã xong 24h qua"
+
+- Trước đây digest sáng chỉ liệt kê task đang mở + nhắc task quá hạn; ngày nào không còn task mở thì không đăng gì — Martin không biết hôm qua xong được những gì.
+- Từ v1.15.0, digest sáng thêm mục **"Đã xong 24h qua"**: task xong trong 24h qua + **PR đã merge trong 24h qua** (tin webhook `pull_request` có `github.merged=true`, dự phòng khớp text "(đã merge)"). Mốc xong của task là `task.doneAt` — đóng dấu (ISO) ngay khi task chuyển sang `done` (qua lệnh Telegram, nút trên board, `PATCH /api/messages/:id/task`, hoặc Issue GitHub liên kết bị đóng), xóa dấu khi mở lại; lưu cùng task trong `messages.jsonl` nên restart server không mất. Audit (`task.update`, v1.9.0) chỉ ghi action mà không ghi trạng thái mới nên không suy ra được giờ xong — vì vậy phải đóng dấu riêng. Task đã done từ trước v1.15.0 không có `doneAt` thì không tính vào mục này (không rõ giờ xong thật).
+- **Không còn task mở nhưng có việc xong trong 24h thì digest vẫn đăng** (chỉ khi không còn gì để báo — không task mở, không việc xong, không PR merge — mới không đăng).
+
+### 2. Báo cáo tuần — tóm tắt 7 ngày qua, mỗi tuần 1 lần
+
+- Mỗi tuần 1 lần vào `WEEKLY_REPORT_DAY` lúc `WEEKLY_REPORT_TIME` (mặc định **Thứ 2 08:00**, giờ địa phương của máy chạy bridge), bridge đăng 1 tin báo cáo tuần (sender `bridge`, source `weekly-report`) + gửi Telegram, tóm tắt 7 ngày qua: **task đã xong** (số lượng + `#id` + dòng đầu), **PR đã merge**, **task/idea mới tạo**, **task còn mở** (số lượng + theo từng người nhận), **quá hạn / cần chú ý** (quá hạn, đang blocked, mở quá 7 ngày chưa xong). Tuần không có việc gì thì các mục ghi "(không có)" — báo cáo vẫn đăng để Martin biết tuần đó trống.
+- **Mỗi tuần chỉ đăng 1 lần:** tuần đã đăng (ngày thứ 2 đầu tuần, ví dụ tuần bắt đầu 2026-11-23 ghi `2026-11-23`) lưu vào `digest-state.json` cùng `lastDigestDate`, restart server cũng không đăng trùng. Server tắt đúng giờ hẹn thì **đăng bù ở tick tiếp theo trong cùng tuần** (mốc so là giờ hẹn của tuần đó); nếu tắt cả tuần thì đăng bù vào đầu tuần sau, và lần đăng bù ghi đúng tuần của giờ hẹn nên không nuốt mất lần đăng định kỳ tiếp theo.
+- Xem trước: `GET /api/weekly-report?token=<BRIDGE_TOKEN>` (nội dung sẽ đăng, không đăng thật; trả thêm `due`, `enabled`, `day`, `time`, `lastWeek`). Ép đăng ngay: `POST /api/weekly-report {"token"}`. Tắt hẳn lịch tự đăng: `WEEKLY_REPORT_ENABLED=0` — ép đăng tay vẫn được (giống `POST /api/digest` force bỏ qua giờ). `/health` và `/api/status` thêm mục `weeklyReport` (`enabled`, `day`, `time`, `lastWeek`); trang `/status` và panel trạng thái trên board thêm 1 dòng Báo cáo tuần; footer board thêm 2 endpoint mới.
+
 ## Tính năng mới trong v1.14.0 (digest thông báo + ack bắt buộc cho task — ý 1 + ý 3 trong 6 ý tối ưu communication của Muse B ở tin #320; Martin hỏi còn tối ưu được gì ở #319, Muse A giao ý 1 + 3 cho Muse B ở #321)
 
 ### 1. Digest thông báo định kỳ — gom tin routine, board đỡ ngập
